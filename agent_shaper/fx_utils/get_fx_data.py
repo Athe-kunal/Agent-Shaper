@@ -7,6 +7,7 @@ per-node information as a list of FxNodeInfo NamedTuples for downstream use.
 
 from __future__ import annotations
 
+import inspect
 import re
 from typing import Any, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -55,6 +56,21 @@ class FxNodeInfo(NamedTuple):
     Non-node (Python literal) arguments baked into this op.
     e.g. for layer_norm → [[64], 1e-05];  for split → [64, 2].
     """
+
+    module_line_start: Optional[int]
+    """
+    First line of the innermost nn.Module *class* in its source file.
+    e.g. CausalSelfAttention starts at line 29 in model.py.
+    """
+
+    module_line_end: Optional[int]
+    """Last line of the innermost nn.Module class (inclusive)."""
+
+    module_source_file: Optional[str]
+    """Absolute path to the file that defines the innermost nn.Module class."""
+
+    module_source: Optional[str]
+    """Full source code of the innermost nn.Module class."""
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -113,6 +129,41 @@ def _literal_args(node: torch.fx.Node) -> list:
     return parts
 
 
+def _module_source_info(
+    node: torch.fx.Node,
+    root_module: Optional[nn.Module] = None,
+) -> Tuple[Optional[int], Optional[int], Optional[str], Optional[str]]:
+    """
+    Return (line_start, line_end, source_file, source_code) for the innermost
+    nn.Module class that owns this node, using inspect on the class definition.
+
+    ``nn_module_stack`` is empty when the node belongs to the root module itself
+    (torch.export only tracks submodule ancestry).  In that case *root_module*
+    is used as the fallback so root-level exports still get source info.
+
+    Nodes such as get_attr / placeholder that carry no module attribution
+    return (None, None, None, None).
+    """
+    stack = node.meta.get("nn_module_stack") or {}
+    if stack:
+        _, mod_instance = list(stack.values())[-1]
+        cls = type(mod_instance)
+    elif root_module is not None:
+        cls = type(root_module)
+    else:
+        return None, None, None, None
+
+    try:
+        source_lines, start_lineno = inspect.getsourcelines(cls)
+        source_file = inspect.getfile(cls)
+    except (OSError, TypeError):
+        return None, None, None, None
+
+    end_lineno = start_lineno + len(source_lines) - 1
+    source_code = "".join(source_lines)
+    return start_lineno, end_lineno, source_file, source_code
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def get_fx_data(
@@ -140,7 +191,8 @@ def get_fx_data(
     Returns
     -------
     list[FxNodeInfo]
-        One entry per node in the exported FX graph.
+        One entry per node in the exported FX graph, in sequential execution
+        order (topological order as produced by torch.export).
     """
     module = module.eval()
 
@@ -150,19 +202,24 @@ def get_fx_data(
     ShapeProp(gm).propagate(*example_args)
 
     results: list[FxNodeInfo] = []
-    for node in gm.graph.nodes:
-        shape, dtype = _parse_tensor_meta(node.meta.get("tensor_meta"))
+    for node in gm.graph.nodes:            # already in sequential call order
+        shape, dtype                          = _parse_tensor_meta(node.meta.get("tensor_meta"))
+        line_start, line_end, src_file, source = _module_source_info(node, root_module=module)
 
         results.append(
             FxNodeInfo(
-                name          = node.name,
-                op            = node.op,
-                target        = node.target,
-                source_line   = _source_line(node, source_filename),
-                output_shape  = shape,
-                output_dtype  = dtype,
-                module_origin = _module_origin(node),
-                constants     = _literal_args(node),
+                name                = node.name,
+                op                  = node.op,
+                target              = node.target,
+                source_line         = _source_line(node, source_filename),
+                output_shape        = shape,
+                output_dtype        = dtype,
+                module_origin       = _module_origin(node),
+                constants           = _literal_args(node),
+                module_line_start   = line_start,
+                module_line_end     = line_end,
+                module_source_file  = src_file,
+                module_source       = source,
             )
         )
 
@@ -172,6 +229,7 @@ def get_fx_data(
 # ─── CLI smoke-test ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
     from agent_shaper.transformer.model import (
         GPT, GPTConfig,
         LayerNorm, CausalSelfAttention, MLP, Block,
@@ -204,14 +262,25 @@ if __name__ == "__main__":
 
     for display_name, module, args in modules_to_test:
         nodes = get_fx_data(module, args)
+
+        # Module-level info — same for every node, grab from first non-None hit
+        mod_info = next((n for n in nodes if n.module_line_start is not None), None)
+        if mod_info is not None:
+            rel_path = os.path.relpath(mod_info.module_source_file)
+            line_range = f"L{mod_info.module_line_start}–L{mod_info.module_line_end}"
+        else:
+            rel_path, line_range = "—", "—"
+
         print(f"\n{SEP}")
-        print(f"  {display_name}  —  {len(nodes)} nodes")
+        print(f"  {display_name}  —  {len(nodes)} nodes  ({line_range})  {rel_path}")
         print(SEP)
-        print(f"  {'name':<38}  {'line':<6}  {'shape':<32}  {'module origin':<38}  constants")
-        print(f"  {'-'*38}  {'-'*6}  {'-'*32}  {'-'*38}  ---------")
+
+        # Per-node table: tensor-relevant columns only
+        print(f"  {'node':<38}  {'call':^6}  {'shape':<32}  {'dtype':<18}  constants")
+        print(f"  {'-'*38}  {'-'*6}  {'-'*32}  {'-'*18}  ---------")
         for n in nodes:
-            shape_s  = str(n.output_shape)  if n.output_shape  is not None else "—"
-            origin_s = n.module_origin      if n.module_origin is not None else "—"
-            line_s   = f"L{n.source_line}"  if n.source_line   is not None else "—"
-            consts_s = repr(n.constants)    if n.constants                  else "—"
-            print(f"  {n.name:<38}  {line_s:<6}  {shape_s:<32}  {origin_s:<38}  {consts_s}")
+            line_s   = f"L{n.source_line}" if n.source_line  is not None else "—"
+            shape_s  = str(n.output_shape) if n.output_shape is not None else "—"
+            dtype_s  = str(n.output_dtype) if n.output_dtype is not None else "—"
+            consts_s = repr(n.constants)   if n.constants                 else "—"
+            print(f"  {n.name:<38}  {line_s:^6}  {shape_s:<32}  {dtype_s:<18}  {consts_s}")
