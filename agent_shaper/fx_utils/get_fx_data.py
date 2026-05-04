@@ -1,15 +1,16 @@
 """
 get_fx_data.py
 --------------
-Export a callable nn.Module with torch.export, run ShapeProp, and return
-per-node information as a list of FxNodeInfo NamedTuples for downstream use.
+Export an nn.Module with torch.export, run ShapeProp, and return per-module
+tensor shape metadata in topological execution order.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 import re
-from typing import Any, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -17,83 +18,57 @@ import torch.fx
 from torch.fx.passes.shape_prop import ShapeProp
 
 
-# ─── Return type ─────────────────────────────────────────────────────────────
-
-class FxNodeInfo(NamedTuple):
-    """All extracted metadata for a single node in the exported FX graph."""
+class TensorInfo(NamedTuple):
+    """Shape metadata for one node in the exported FX graph."""
 
     name: str
-    """FX node name (e.g. 'layer_norm', 'split', 'linear_1')."""
+    """FX node name, e.g. 'layer_norm', 'linear_1'."""
 
-    op: str
-    """FX op kind: placeholder | get_attr | call_function | call_method | output."""
+    shape: Optional[Union[Tuple[int, ...], Sequence[Optional[Tuple[int, ...]]]]]
+    """Output shape — tuple for single tensors, list for multi-output nodes, None otherwise."""
 
-    target: Any
-    """The concrete callable / attribute string that this node invokes."""
+    dtype: Optional[Union[torch.dtype, Sequence[Optional[torch.dtype]]]]
+    """Output dtype(s), mirroring shape."""
 
-    source_line: Optional[int]
-    """Line number in the originating source file, or None if not available."""
+    line_number: Optional[int]
+    """Line in source_filename where this op was called, or None."""
 
-    output_shape: Optional[Union[Tuple[int, ...], Sequence[Optional[Tuple[int, ...]]]]]
-    """
-    Output tensor shape(s).
-    - Single tensor  → tuple[int, ...]
-    - Multi-output   → list[tuple[int, ...] | None]   (None for non-tensor slots)
-    - Non-tensor op  → None
-    """
 
-    output_dtype: Optional[Union[torch.dtype, Sequence[Optional[torch.dtype]]]]
-    """Mirrors output_shape but carries the dtype(s)."""
+class ModuleCallInfo(NamedTuple):
+    """All tensor shapes owned by one nn.Module instance, in topological order."""
 
-    module_origin: Optional[str]
-    """
-    Innermost nn.Module class name + extra_repr() that owns this op.
-    e.g. 'Linear(in_features=64, out_features=192, bias=True)'
-    """
+    class_name: str
+    """Simple class name, e.g. 'CausalSelfAttention'."""
 
-    constants: Sequence[Any]
-    """
-    Non-node (Python literal) arguments baked into this op.
-    e.g. for layer_norm → [[64], 1e-05];  for split → [64, 2].
-    """
+    module_origin: str
+    """Qualified instance path, e.g. 'transformer.h.0.attn'.  Empty string = root module."""
 
-    module_line_start: Optional[int]
-    """
-    First line of the innermost nn.Module *class* in its source file.
-    e.g. CausalSelfAttention starts at line 29 in model.py.
-    """
+    line_start: Optional[int]
+    """First line of the class definition in its source file."""
 
-    module_line_end: Optional[int]
-    """Last line of the innermost nn.Module class (inclusive)."""
+    line_end: Optional[int]
+    """Last line of the class definition (inclusive)."""
 
-    module_source_file: Optional[str]
-    """Absolute path to the file that defines the innermost nn.Module class."""
+    source_file: Optional[str]
+    """Relative path from cwd to the file that defines the class."""
 
-    module_source: Optional[str]
-    """Full source code of the innermost nn.Module class."""
+    tensors: list
+    """list[TensorInfo] — every tensor produced by this module instance, in execution order."""
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
-def _parse_tensor_meta(
-    meta: Any,
-) -> Tuple[
-    Optional[Union[Tuple[int, ...], list]],
-    Optional[Union[torch.dtype, list]],
-]:
-    """Decompose a node's tensor_meta into (shape, dtype)."""
+def _parse_tensor_meta(meta):
     if meta is None:
         return None, None
-    if hasattr(meta, "shape"):                          # single TensorMetadata
+    if hasattr(meta, "shape"):
         return tuple(meta.shape), meta.dtype
-    # immutable_list — multi-output node (e.g. aten.split, tuple returns)
     shapes = [tuple(m.shape) if m is not None else None for m in meta]
     dtypes = [m.dtype        if m is not None else None for m in meta]
     return shapes, dtypes
 
 
-def _source_line(node: torch.fx.Node, filename: str = "model.py") -> Optional[int]:
-    """Return the innermost line number in *filename* from node.stack_trace."""
+def _source_line(node: torch.fx.Node, filename: str) -> Optional[int]:
     trace = getattr(node, "stack_trace", None) or node.meta.get("stack_trace", "")
     if not trace:
         return None
@@ -101,139 +76,142 @@ def _source_line(node: torch.fx.Node, filename: str = "model.py") -> Optional[in
     return int(hits[-1]) if hits else None
 
 
-def _module_origin(node: torch.fx.Node) -> Optional[str]:
-    """
-    Innermost nn.Module from nn_module_stack formatted as
-    'ClassName(extra_repr)'.
-    """
+def _stack_val_to_instance(val, path_to_module):
+    if not (isinstance(val, tuple) and len(val) == 2):
+        return None
+    first, second = val
+    if isinstance(second, nn.Module):
+        return second
+    if path_to_module is not None and isinstance(first, str):
+        return path_to_module.get(first)
+    return None
+
+
+def _module_origin(node: torch.fx.Node, path_to_module) -> Optional[str]:
     stack = node.meta.get("nn_module_stack") or {}
     if not stack:
         return None
-    cls_name, mod_instance = list(stack.values())[-1]
+    last_val = list(stack.values())[-1]
+    if isinstance(last_val, tuple) and len(last_val) == 2:
+        qual_path, second = last_val
+        if isinstance(qual_path, str) and isinstance(second, str):
+            return qual_path
+        if isinstance(second, nn.Module):
+            return list(stack.keys())[-1]
+    return None
+
+
+def _is_workspace_cls(cls: type, workspace: str) -> bool:
     try:
-        r = mod_instance.extra_repr()
-        return f"{cls_name}({r})" if r else cls_name
-    except Exception:
-        return cls_name
-
-
-def _literal_args(node: torch.fx.Node) -> list:
-    """Collect non-node (Python literal) values from node.args and node.kwargs."""
-    parts: list = []
-    for a in node.args:
-        if not isinstance(a, torch.fx.Node):
-            parts.append(a)
-    for k, v in (node.kwargs or {}).items():
-        if not isinstance(v, torch.fx.Node):
-            parts.append(v)          # callers can use (k, v) pairs if needed
-    return parts
-
-
-def _module_source_info(
-    node: torch.fx.Node,
-    root_module: Optional[nn.Module] = None,
-) -> Tuple[Optional[int], Optional[int], Optional[str], Optional[str]]:
-    """
-    Return (line_start, line_end, source_file, source_code) for the innermost
-    nn.Module class that owns this node, using inspect on the class definition.
-
-    ``nn_module_stack`` is empty when the node belongs to the root module itself
-    (torch.export only tracks submodule ancestry).  In that case *root_module*
-    is used as the fallback so root-level exports still get source info.
-
-    Nodes such as get_attr / placeholder that carry no module attribution
-    return (None, None, None, None).
-    """
-    stack = node.meta.get("nn_module_stack") or {}
-    if stack:
-        _, mod_instance = list(stack.values())[-1]
-        cls = type(mod_instance)
-    elif root_module is not None:
-        cls = type(root_module)
-    else:
-        return None, None, None, None
-
-    try:
-        source_lines, start_lineno = inspect.getsourcelines(cls)
-        source_file = inspect.getfile(cls)
+        f = inspect.getfile(cls)
+        return f.startswith(workspace) and "site-packages" not in f
     except (OSError, TypeError):
-        return None, None, None, None
+        return False
 
-    end_lineno = start_lineno + len(source_lines) - 1
-    source_code = "".join(source_lines)
-    return start_lineno, end_lineno, source_file, source_code
+
+def _innermost_workspace_cls(node, root_cls, workspace, path_to_module=None):
+    stack = node.meta.get("nn_module_stack") or {}
+    for val in reversed(list(stack.values())):
+        mod = _stack_val_to_instance(val, path_to_module)
+        if mod is not None:
+            cls = type(mod)
+            if _is_workspace_cls(cls, workspace):
+                return cls
+    if _is_workspace_cls(root_cls, workspace):
+        return root_cls
+    return None
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
-def get_fx_data(
+def get_module_shapes(
     module: nn.Module,
     example_args: tuple,
     source_filename: str = "model.py",
-) -> list[FxNodeInfo]:
+    workspace: Optional[str] = None,
+) -> list[ModuleCallInfo]:
     """
-    Export *module* with torch.export, propagate shapes, and return per-node
-    metadata as a list of :class:`FxNodeInfo` NamedTuples.
+    Export *module* with torch.export, propagate shapes, and return one
+    :class:`ModuleCallInfo` per workspace-defined nn.Module instance encountered
+    in the graph — in topological (execution) order.
 
     Parameters
     ----------
     module:
-        An ``nn.Module`` in eval mode.  If not already in eval mode the
-        function will call ``.eval()`` on a copy — the caller's instance is
-        left unchanged.
+        nn.Module to analyse (eval mode is set automatically).
     example_args:
-        A tuple of concrete example tensors that match the module's ``forward``
-        signature (same role as in ``torch.export.export``).
+        Concrete example inputs matching the module's forward signature.
     source_filename:
-        Basename used when scanning ``node.stack_trace`` for source line
-        numbers.  Defaults to ``"model.py"``.
+        Basename used to extract per-tensor line numbers from stack traces.
+    workspace:
+        Root directory that defines "your code" vs PyTorch internals.
+        Defaults to os.getcwd().
 
     Returns
     -------
-    list[FxNodeInfo]
-        One entry per node in the exported FX graph, in sequential execution
-        order (topological order as produced by torch.export).
+    list[ModuleCallInfo]
+        One entry per module instance, ordered by first appearance in the graph.
+        Each entry carries the tensor shapes of every node owned by that instance.
     """
+    workspace = workspace or os.getcwd()
+    root_cls = type(module)
     module = module.eval()
+    path_to_module: dict = dict(module.named_modules())
 
     exported = torch.export.export(module, example_args)
     gm: torch.fx.GraphModule = exported.module()
-
     ShapeProp(gm).propagate(*example_args)
 
-    results: list[FxNodeInfo] = []
-    for node in gm.graph.nodes:            # already in sequential call order
-        shape, dtype                          = _parse_tensor_meta(node.meta.get("tensor_meta"))
-        line_start, line_end, src_file, source = _module_source_info(node, root_module=module)
+    seen_keys: list[tuple] = []      # (module_origin, cls) in first-seen order
+    key_to_tensors: dict = {}
 
-        results.append(
-            FxNodeInfo(
-                name                = node.name,
-                op                  = node.op,
-                target              = node.target,
-                source_line         = _source_line(node, source_filename),
-                output_shape        = shape,
-                output_dtype        = dtype,
-                module_origin       = _module_origin(node),
-                constants           = _literal_args(node),
-                module_line_start   = line_start,
-                module_line_end     = line_end,
-                module_source_file  = src_file,
-                module_source       = source,
+    for node in gm.graph.nodes:
+        cls = _innermost_workspace_cls(node, root_cls, workspace, path_to_module)
+        if cls is None:
+            continue
+
+        origin = _module_origin(node, path_to_module) or ""
+        key = (origin, cls)
+
+        shape, dtype = _parse_tensor_meta(node.meta.get("tensor_meta"))
+        tensor = TensorInfo(
+            name=node.name,
+            shape=shape,
+            dtype=dtype,
+            line_number=_source_line(node, source_filename),
+        )
+
+        if key not in key_to_tensors:
+            seen_keys.append(key)
+            key_to_tensors[key] = []
+        key_to_tensors[key].append(tensor)
+
+    result: list[ModuleCallInfo] = []
+    for (origin, cls) in seen_keys:
+        try:
+            src_lines, start = inspect.getsourcelines(cls)
+            src_file = os.path.relpath(inspect.getfile(cls))
+        except (OSError, TypeError):
+            start, src_file, src_lines = None, None, []
+        end = (start + len(src_lines) - 1) if start is not None else None
+        result.append(
+            ModuleCallInfo(
+                class_name=cls.__name__,
+                module_origin=origin,
+                line_start=start,
+                line_end=end,
+                source_file=src_file,
+                tensors=key_to_tensors[(origin, cls)],
             )
         )
 
-    return results
+    return result
 
 
 # ─── CLI smoke-test ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import os
-    from agent_shaper.transformer.model import (
-        GPT, GPTConfig,
-        LayerNorm, CausalSelfAttention, MLP, Block,
-    )
+    from agent_shaper.transformer.model import GPT, GPTConfig
 
     cfg = GPTConfig(
         block_size=32,
@@ -245,42 +223,20 @@ if __name__ == "__main__":
         bias=True,
     )
 
-    B, T, C = 2, 16, cfg.n_embd
+    B, T = 2, 16
+    example_args = (
+        torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
+        torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
+    )
 
-    modules_to_test = [
-        ("LayerNorm",           LayerNorm(C, bias=True),         (torch.rand(B, T, C),)),
-        ("CausalSelfAttention", CausalSelfAttention(cfg),        (torch.rand(B, T, C),)),
-        ("MLP",                 MLP(cfg),                        (torch.rand(B, T, C),)),
-        ("Block",               Block(cfg),                      (torch.rand(B, T, C),)),
-        ("GPT",                 GPT(cfg),                        (
-            torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
-            torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),  # targets
-        )),
-    ]
+    groups = get_module_shapes(GPT(cfg), example_args)
 
-    SEP = "═" * 100
-
-    for display_name, module, args in modules_to_test:
-        nodes = get_fx_data(module, args)
-
-        # Module-level info — same for every node, grab from first non-None hit
-        mod_info = next((n for n in nodes if n.module_line_start is not None), None)
-        if mod_info is not None:
-            rel_path = os.path.relpath(mod_info.module_source_file)
-            line_range = f"L{mod_info.module_line_start}–L{mod_info.module_line_end}"
-        else:
-            rel_path, line_range = "—", "—"
-
+    SEP = "═" * 80
+    for g in groups:
+        origin_s = g.module_origin or "root"
         print(f"\n{SEP}")
-        print(f"  {display_name}  —  {len(nodes)} nodes  ({line_range})  {rel_path}")
+        print(f"  {g.class_name}  [{origin_s}]  L{g.line_start}–L{g.line_end}  {g.source_file}")
         print(SEP)
-
-        # Per-node table: tensor-relevant columns only
-        print(f"  {'node':<38}  {'call':^6}  {'shape':<32}  {'dtype':<18}  constants")
-        print(f"  {'-'*38}  {'-'*6}  {'-'*32}  {'-'*18}  ---------")
-        for n in nodes:
-            line_s   = f"L{n.source_line}" if n.source_line  is not None else "—"
-            shape_s  = str(n.output_shape) if n.output_shape is not None else "—"
-            dtype_s  = str(n.output_dtype) if n.output_dtype is not None else "—"
-            consts_s = repr(n.constants)   if n.constants                 else "—"
-            print(f"  {n.name:<38}  {line_s:^6}  {shape_s:<32}  {dtype_s:<18}  {consts_s}")
+        for t in g.tensors:
+            line_s = f"L{t.line_number}" if t.line_number is not None else "—"
+            print(f"  {t.name:<32}  {line_s:^6}  shape={t.shape}  dtype={t.dtype}")
