@@ -58,15 +58,18 @@ The numbers in the shapes are concrete dummy values from one example forward pas
 they are NOT fixed constants. Always use descriptive index names that reflect what
 each dimension represents (e.g. b=batch, t=seq_len, h=n_head, d=head_dim).
 
-Your task:
-1. Return the EXACT same nn.Module class — every line that does not involve a matrix
-   operation must be preserved byte-for-byte.
-2. Convert matrix multiplications, batched matmuls, and attention-style operations
-   to torch.einsum with descriptive index names and an explanatory comment.
-3. Leave operations that do not map naturally to einsum (layer_norm, softmax, view,
-   transpose, etc.) completely unchanged.
+Your task — rewrite the entire nn.Module using einsum notation:
+1. Replace ALL matrix multiplications, batched matmuls, linear projections, and
+   attention-style operations with torch.einsum calls using descriptive index names.
+2. Replace view/transpose/reshape sequences that exist solely to set up a matmul
+   with the equivalent einsum directly — eliminate the intermediate reshapes where
+   einsum makes them unnecessary.
+3. Remove the raw-number shape annotations from the original comments; if you keep
+   any comment on a line, it must describe the einsum index meaning, not raw numbers.
+4. Everything that cannot be expressed as einsum (layer_norm, softmax, dropout,
+   activation functions, embedding lookups) must be preserved byte-for-byte.
 
-CRITICAL: Your response must be the complete nn.Module class and nothing else.
+CRITICAL: Your response must be the complete rewritten nn.Module class and nothing else.
 No explanation, no markdown fences, no prose before or after the class."""
 
 
@@ -242,9 +245,9 @@ if __name__ == "__main__":
         annotated = await llm_annotate_module_source(
             GPT(cfg),
             example_args,
-            mode=AnnotationMode.COMMENT,
+            mode=AnnotationMode.EINSUM,
             dim_names=dim_names,
-            output_dir="llm_annotated_output",
+            output_dir="llm_annotated_output_einsum",
         )
         SEP = "═" * 80
         for path, src in annotated.items():
