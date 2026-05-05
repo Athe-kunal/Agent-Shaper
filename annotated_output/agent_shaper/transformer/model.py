@@ -20,11 +20,11 @@ class LayerNorm(nn.Module):
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight = nn.Parameter(torch.ones(ndim))  # weight: (64)
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None  # bias: (64)
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)  # layer_norm: (B, T, 64)
 
 class CausalSelfAttention(nn.Module):
 
@@ -51,25 +51,25 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() 
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)  # (q, k, v): (B, T, 192) → [(B, T, 64), (B, T, 64), (B, T, 64)] → (B, T, 64)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # k: (B, T, B, 32) → (B, B, T, 32)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # q: (B, T, B, 32) → (B, B, T, 32)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # v: (B, T, B, 32) → (B, B, T, 32)
 
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # att: (B, B, 32, T) → (B, B, T, T) → (B, B, T, T)
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # att: (1, 1, T, 32) → (1, 1, T, T) → (1, 1, T, T) → (B, B, T, T)
+            att = F.softmax(att, dim=-1)  # att [softmax.int]: (B, B, T, T)
+            att = self.attn_dropout(att)  # att [dropout.default]: (B, B, T, T)
+            y = att @ v  # y [matmul.default]: (B, B, T, 32)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # y: (B, T, B, 32) → (B, T, B, 32) → (B, T, 64)
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.c_proj(y))  # y: (B, T, 64) → (B, T, 64)
         return y
 
 class MLP(nn.Module):
@@ -82,10 +82,10 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        x = self.c_fc(x)  # x [linear.default]: (B, T, 256)
+        x = self.gelu(x)  # x [gelu.default]: (B, T, 256)
+        x = self.c_proj(x)  # x [linear.default]: (B, T, 64)
+        x = self.dropout(x)  # x [dropout.default]: (B, T, 64)
         return x
 
 class Block(nn.Module):
@@ -98,8 +98,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))  # x [add.Tensor]: (B, T, 64)
+        x = x + self.mlp(self.ln_2(x))  # x [add.Tensor]: (B, T, 64)
         return x
 
 @dataclass
@@ -163,20 +163,20 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)  # pos [arange.start]: (T)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx)  # tok_emb [embedding.default]: (B, T, 64)
+        pos_emb = self.transformer.wpe(pos)  # pos_emb [embedding.default]: (T, 64)
+        x = self.transformer.drop(tok_emb + pos_emb)  # x: (B, T, 64) → (B, T, 64)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = self.lm_head(x)  # logits [linear.default]: (B, T, 256)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)  # loss: (32, 256) → (32) → ()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
