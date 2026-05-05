@@ -10,8 +10,10 @@ All modules are processed in parallel via asyncio.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import enum
 import os
+import subprocess
 from collections import defaultdict
 from typing import Optional
 
@@ -116,6 +118,36 @@ def _extract_class_src(
     return "".join(annotated_lines[line_start - 1 : line_end])
 
 
+_ANSI_RED = "\033[31m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_CYAN = "\033[36m"
+_ANSI_RESET = "\033[0m"
+
+
+def _colored_diff(original: str, rewritten: str, filename: str) -> str:
+    """Return a unified diff between original and rewritten with ANSI colours.
+
+    Red  (-) lines: original code that was changed or removed.
+    Green(+) lines: LLM-rewritten replacements.
+    """
+    orig_lines = original.splitlines(keepends=True)
+    new_lines = rewritten.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        orig_lines, new_lines, fromfile=f"original/{filename}", tofile=f"llm/{filename}"
+    )
+    parts: list[str] = []
+    for line in diff:
+        if line.startswith("---") or line.startswith("+++"):
+            parts.append(f"{_ANSI_CYAN}{line}{_ANSI_RESET}")
+        elif line.startswith("-"):
+            parts.append(f"{_ANSI_RED}{line}{_ANSI_RESET}")
+        elif line.startswith("+"):
+            parts.append(f"{_ANSI_GREEN}{line}{_ANSI_RESET}")
+        else:
+            parts.append(line)
+    return "".join(parts)
+
+
 def _apply_replacements(
     source_lines: list[str],
     replacements: list[tuple[int, int, str]],
@@ -140,6 +172,8 @@ async def llm_annotate_module_source(
     workspace: Optional[str] = None,
     dim_names: Optional[dict[str, int]] = None,
     output_dir: Optional[str] = None,
+    show_diff: bool = False,
+    open_in_vscode: bool = True,
 ) -> dict[str, str]:
     """Rewrite workspace nn.Module classes using an LLM.
 
@@ -149,6 +183,8 @@ async def llm_annotate_module_source(
 
     Returns {relative_source_file: rewritten_source_code}.
     If output_dir is given, writes files under that directory preserving path structure.
+    If show_diff is True, prints a colour-coded unified diff (red = original, green = LLM)
+    instead of printing the full rewritten source.
     """
     model = os.environ["OPENAI_MODEL"]
     client = AsyncOpenAI(
@@ -207,14 +243,22 @@ async def llm_annotate_module_source(
         src_lines = file_source_lines.get(src_file)
         if src_lines is None:
             continue
+        original = "".join(src_lines)
         rewritten = _apply_replacements(src_lines, replacements)
         result[src_file] = rewritten
+
+        if show_diff:
+            print(_colored_diff(original, rewritten, os.path.basename(src_file)))
 
         if output_dir is not None:
             out_path = os.path.join(output_dir, src_file)
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             with open(out_path, "w") as fh:
                 fh.write(rewritten)
+            if open_in_vscode:
+                subprocess.run(
+                    ["code", "--diff", os.path.abspath(src_file), os.path.abspath(out_path)]
+                )
 
     return result
 
@@ -242,18 +286,13 @@ if __name__ == "__main__":
     dim_names = {"B": B, "T": T}
 
     async def main():
-        annotated = await llm_annotate_module_source(
+        await llm_annotate_module_source(
             GPT(cfg),
             example_args,
             mode=AnnotationMode.EINSUM,
             dim_names=dim_names,
-            output_dir="llm_annotated_output_einsum",
+            output_dir="llm_annotated_output_einsum_diff",
+            show_diff=True,
         )
-        SEP = "═" * 80
-        for path, src in annotated.items():
-            print(f"\n{SEP}")
-            print(f"  {path}")
-            print(SEP)
-            print(src)
 
     asyncio.run(main())

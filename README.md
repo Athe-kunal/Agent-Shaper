@@ -9,6 +9,7 @@ Agent Shaper extracts per-module tensor shape metadata from any PyTorch `nn.Modu
 3. **LLM annotation** (`fx_utils/llm_annotate.py`) — feeds each manually-annotated module class to an LLM in parallel. Two modes:
    - **COMMENT** — rewrites comments with descriptive dimension names (e.g. `batch_size`, `seq_len`, `n_embd`) and plain-English explanations of each transformation.
    - **EINSUM** — rewrites the entire module replacing matmuls and attention operations with `torch.einsum`, collapsing intermediate reshapes where possible.
+4. **Diff viewer** — review LLM changes before accepting them, either in a Streamlit UI or directly in VS Code's native diff editor.
 
 All modules in a file are processed in parallel via `asyncio`. Everything outside the module classes (imports, dataclasses, config objects) is preserved unchanged in the output file.
 
@@ -20,6 +21,7 @@ agent_shaper/
     get_fx_data.py       # shape extraction via torch.export + ShapeProp
     manual_annotate.py   # inline shape comment insertion
     llm_annotate.py      # LLM-powered rewrite (COMMENT or EINSUM mode)
+    diff_viewer.py       # Streamlit diff UI
   transformer/
     model.py             # example GPT model (nanoGPT)
     run_transformer.py   # example forward pass
@@ -106,6 +108,18 @@ Or run the built-in smoke test:
 ```bash
 python -m agent_shaper.fx_utils.llm_annotate
 ```
+
+### Reviewing diffs
+
+By default, after generating the LLM-annotated file, VS Code opens automatically showing a side-by-side diff of the original vs. the rewritten file (`open_in_vscode=True`). Pass `open_in_vscode=False` to suppress this.
+
+You can also use the Streamlit diff viewer for a browser-based review:
+
+```bash
+.venv/bin/streamlit run agent_shaper/fx_utils/diff_viewer.py
+```
+
+Enter the path to the original file on the left and the generated file (e.g. `llm_annotated_output/agent_shaper/transformer/model.py`) on the right. The viewer renders a syntax-highlighted unified diff.
 
 ### `dim_names`
 

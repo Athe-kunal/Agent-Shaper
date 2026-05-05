@@ -8,5 +8,6 @@ dependencies = [
     "debugpy>=1.8.20",
     "numpy>=2.4.4",
     "openai>=2.34.0",
+    "streamlit>=1.57.0",
     "torch>=2.11.0",
 ]
