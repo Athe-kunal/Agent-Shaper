@@ -24,7 +24,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None  # bias: (feature_dim)
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)  # layer_norm: (batch_size, seq_len, feature_dim)
 
 class CausalSelfAttention(nn.Module):
 
@@ -50,50 +50,26 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size()
-        qkv = self.c_attn(x)  # (B, T, 3*C)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-
-        d_head = C // self.n_head
-
-        # q, k, v: (B, T, n_head, d_head) with head dimension separated
-        q = torch.einsum('btc,hd->bthd', q, torch.eye(self.n_head, device=q.device, dtype=q.dtype).repeat_interleave(d_head, dim=1)[:, :self.n_head].t())
-        k = torch.einsum('btc,hd->bthd', k, torch.eye(self.n_head, device=k.device, dtype=k.dtype).repeat_interleave(d_head, dim=1)[:, :self.n_head].t())
-        v = torch.einsum('btc,hd->bthd', v, torch.eye(self.n_head, device=v.device, dtype=v.dtype).repeat_interleave(d_head, dim=1)[:, :self.n_head].t())
-
-        # The above einsum is a placeholder for reshaping; replace with direct einsum-based projection:
-        # Recompute q, k, v using direct index mapping from the original (B,T,C) layout.
-        q = qkv.new_empty(B, T, self.n_head, d_head)
-        k = qkv.new_empty(B, T, self.n_head, d_head)
-        v = qkv.new_empty(B, T, self.n_head, d_head)
-
-        q = q.view(B, T, self.n_head, d_head)
-        k = k.view(B, T, self.n_head, d_head)
-        v = v.view(B, T, self.n_head, d_head)
-
-        # (B, n_head, T, d_head)
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
+        b, t, c = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # (q, k, v): (b, t, 3*n_embd) → [(b, t, n_embd), (b, t, n_embd), (b, t, n_embd)] → (b, t, n_embd)
+        q = q.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
+        k = k.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
+        v = v.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
 
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)  # (b, n_head, t, head_dim)
         else:
             # manual implementation of attention
-            # att[b, h, t, s] = sum_d q[b,h,t,d] * k[b,h,s,d]
-            att = torch.einsum('bhtd,bhsd->bhts', q, k) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            # y[b, h, t, d] = sum_s att[b,h,t,s] * v[b,h,s,d]
-            y = torch.einsum('bhts,bhsd->bhtd', att, v)
+            att = torch.einsum('b h q d, b h k d -> b h q k', q, k) * (1.0 / math.sqrt(k.size(-1)))  # b=batch_size, h=n_head, q=query_pos, k=key_pos, d=head_dim; scaled dot-product: (b,h,q,d) x (b,h,k,d) → (b,h,q,k)
+            att = att.masked_fill(self.bias[:, :, :t, :t] == 0, float('-inf'))  # (b, n_head, t, t)
+            att = F.softmax(att, dim=-1)  # (b, n_head, t, t)
+            att = self.attn_dropout(att)  # (b, n_head, t, t)
+            y = torch.einsum('b h q k, b h k d -> b h q d', att, v)  # b=batch_size, h=n_head, q=query_pos, k=key_pos, d=head_dim; attention-weighted sum: (b,h,q,k) x (b,h,k,d) → (b,h,q,d)
 
-        # (B, T, C)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, C)
-
+        y = y.transpose(1, 2).contiguous().view(b, t, c)  # (b, t, n_embd)
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.c_proj(y))  # (b, t, n_embd)
         return y
 
 class MLP(nn.Module):
@@ -106,15 +82,10 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # x: (b, t, d_model)
-        x = torch.einsum('btd,od->bto', x, self.c_fc.weight)  # (b, t, d_hidden)
-        if self.c_fc.bias is not None:
-            x = x + self.c_fc.bias
-        x = self.gelu(x)  # (b, t, d_hidden)
-        x = torch.einsum('bto,do->btd', x, self.c_proj.weight)  # (b, t, d_model)
-        if self.c_proj.bias is not None:
-            x = x + self.c_proj.bias
-        x = self.dropout(x)  # (b, t, d_model)
+        x = self.c_fc(x)  # x [linear.default]: (batch_size, seq_len, embd_dim)
+        x = self.gelu(x)  # x [gelu.default]: (batch_size, seq_len, embd_dim)
+        x = self.c_proj(x)  # x [linear.default]: (batch_size, seq_len, embd_dim)
+        x = self.dropout(x)  # x [dropout.default]: (batch_size, seq_len, embd_dim)
         return x
 
 class Block(nn.Module):
@@ -127,8 +98,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))  # (b, t, n_embd) + (b, t, n_embd) -> (b, t, n_embd)
+        x = x + self.mlp(self.ln_2(x))  # (b, t, n_embd) + (b, t, n_embd) -> (b, t, n_embd)
         return x
 
 @dataclass
@@ -163,10 +134,10 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -192,26 +163,36 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # (t)  # pos [arange.start]: (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx)  # (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)  # (b, t, n_embd)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x)  # (b, t, n_embd)
+        x = self.transformer.ln_f(x)  # (b, t, n_embd)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            # logits[b, time, vocab] = sum_emb x[b, time, emb] * lm_head.weight[vocab, emb]
-            logits = torch.einsum('bte,ve->btv', x, self.lm_head.weight)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            logits = torch.einsum(
+                'bte,ve->btv',
+                x,
+                self.lm_head.weight
+            )  # b=batch_size, t=seq_len, e=embedding_dim, v=vocab_size; linear projection: (b,t,e) x (v,e) -> (b,t,v)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )  # loss: (b*t, vocab_size) -> (b*t) -> ()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            x_last = x[:, [-1], :]
-            # logits[b, 1, vocab] = sum_emb x_last[b, 1, emb] * lm_head.weight[vocab, emb]
-            logits = torch.einsum('bte,ve->btv', x_last, self.lm_head.weight)
+            x_last = x[:, [-1], :]  # (b, 1, n_embd)
+            logits = torch.einsum(
+                'bte,ve->btv',
+                x_last,
+                self.lm_head.weight
+            )  # b=batch_size, t=seq_len_last_step, e=embedding_dim, v=vocab_size; linear projection: (b,1,e) x (v,e) -> (b,1,v)
             loss = None
 
         return logits, loss
@@ -238,10 +219,10 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
@@ -316,12 +297,12 @@ class GPT(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt)  # per second
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
         flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
@@ -339,16 +320,16 @@ class GPT(nn.Module):
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :] / temperature  # (b, vocab_size)
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))  # (b, top_k)
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)  # (b, vocab_size)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (b, 1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, idx_next), dim=1)  # (b, t+1)
 
         return idx

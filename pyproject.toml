@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "debugpy>=1.8.20",
+    "loguru>=0.7.3",
     "numpy>=2.4.4",
     "openai>=2.34.0",
     "streamlit>=1.57.0",
