@@ -1,8 +1,8 @@
 """
 llm_annotate.py — LLM-powered rewrite of nn.Module source using shape metadata.
 
-EINSUM mode — converts matrix operations to torch.einsum with mandatory inline comments.
-JAX mode    — converts PyTorch tensor operations to JAX/JNP equivalents.
+Converts matrix operations to torch.einsum (with mandatory inline comments) and uses
+einops for structural axis operations where appropriate.
 
 Each class is processed in its own async loop (up to max_turns). After each LLM rewrite
 the result is validated by running the rewritten forward() against captured inputs and
@@ -66,7 +66,6 @@ class _ClassResult(NamedTuple):
 
 class AnnotationMode(enum.Enum):
     EINSUM = "einsum"
-    JAX = "jax"
 
 _SYSTEM_EINSUM = """\
 You are a PyTorch tensor-operation moderniser.
@@ -119,80 +118,6 @@ Your task:
 CRITICAL: Your response must be the complete rewritten nn.Module class and nothing else.
 No explanation, no markdown fences, no prose before or after the class."""
 
-_SYSTEM_JAX = """\
-You are a PyTorch-to-JAX converter.
-
-You will receive a Python nn.Module class that has inline shape comments, for example:
-    y = a @ b.transpose(-2, -1)  # y: (4, 8, 8)
-
-The numbers in the shapes are concrete dummy values from one example forward pass —
-they are NOT fixed constants. Always use descriptive dimension names that reflect what
-each dimension represents (e.g. batch_size, in_features, out_features, num_groups).
-
-Your task is to rewrite the class so that the forward() method uses JAX/JNP operations
-instead of PyTorch operations, while keeping the class structure (including nn.Module
-inheritance and __init__) intact so that existing weight-loading code still works.
-
-Conversion rules:
-1. Replace ALL tensor operations in forward() with JAX equivalents:
-   - torch.matmul / @ / torch.bmm  → jnp.matmul  (or keep @ — JAX arrays support it)
-   - torch.einsum               → jnp.einsum
-   - torch.softmax / F.softmax  → jax.nn.softmax
-   - torch.sigmoid / F.sigmoid  → jax.nn.sigmoid
-   - torch.relu / F.relu        → jax.nn.relu
-   - torch.tanh                 → jnp.tanh
-   - torch.cat                  → jnp.concatenate
-   - torch.stack                → jnp.stack
-   - torch.sum / .sum()         → jnp.sum
-   - torch.mean / .mean()       → jnp.mean
-   - torch.max / .max()         → jnp.max
-   - x.view(...)                → x.reshape(...)  (jnp arrays use reshape)
-   - x.transpose(a, b)          → jnp.swapaxes(x, a, b)
-   - x.permute(...)             → jnp.transpose(x, ...)
-   - x.contiguous()             → x  (no-op in JAX — remove the call)
-   - x.float() / .to(dtype)     → x.astype(jnp.float32)  (or the appropriate jnp dtype)
-   - torch.zeros / ones / full  → jnp.zeros / ones / full
-   - torch.arange               → jnp.arange
-   - torch.where                → jnp.where
-   - F.dropout(x, p, training)  → jax.random.dropout equivalent (use a comment noting
-                                   that JAX dropout requires an explicit PRNG key; leave
-                                   a TODO if the module has no key attribute)
-   Do NOT replace nn.Linear / nn.Embedding / nn.LayerNorm / nn.Dropout module calls in
-   __init__ — leave those as-is. In forward(), convert their use to functional equivalents
-   only when there is a direct JAX counterpart; otherwise preserve the PyTorch call.
-
-2. jnp.einsum equation strings accept ONLY single letters [a-zA-Z].
-   Multi-character subscripts are ILLEGAL.
-
-   WRONG: jnp.einsum('b in_features, out in_features -> b out', x, w)
-   RIGHT: jnp.einsum('bi,oi->bo', x, w)  # b=batch_size, i=in_features, o=out_features; linear projection
-
-   For every jnp.einsum call add an inline comment with:
-   (a) the full descriptive name for every single-letter index, and
-   (b) a one-phrase description of what the operation computes.
-
-3. For reshape/transpose/axis-manipulation operations, add an inline comment describing
-   the axis transformation, e.g.:
-       # split features into num_heads heads: (batch_size, seq_len, hidden) → (batch_size, num_heads, seq_len, head_dim)
-
-4. Remove ALL raw-number shape annotations from every line in the class — including
-   lines you do not otherwise modify. Replace any remaining shape hints with
-   descriptive dimension names only.
-
-5. Add or update an inline comment on every line showing the output shape with descriptive
-   dimension names (e.g. # (batch_size, num_tokens, hidden_dim)).
-
-6. Add `import jax` and `import jax.numpy as jnp` at the top of the class file (the
-   harness will inject these; do NOT include import statements inside the class).
-
-CRITICAL: Your response must be the complete rewritten nn.Module class and nothing else.
-No explanation, no markdown fences, no prose before or after the class."""
-
-_SYSTEM_BY_MODE: dict[AnnotationMode, str] = {
-    AnnotationMode.EINSUM: _SYSTEM_EINSUM,
-    AnnotationMode.JAX: _SYSTEM_JAX,
-}
-
 
 def _outputs_close(a: Any, b: Any, atol: float = 1e-5) -> bool:
     if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
@@ -206,12 +131,9 @@ def _outputs_close(a: Any, b: Any, atol: float = 1e-5) -> bool:
     return True
 
 
-def _build_conversation_start(
-    class_src: str,
-    mode: AnnotationMode = AnnotationMode.EINSUM,
-) -> list[dict]:
+def _build_conversation_start(class_src: str) -> list[dict]:
     return [
-        {"role": "system", "content": _SYSTEM_BY_MODE[mode]},
+        {"role": "system", "content": _SYSTEM_EINSUM},
         {"role": "user", "content": class_src},
     ]
 
@@ -229,41 +151,12 @@ async def _rewrite_class_turn(
     return response.choices[0].message.content.strip()
 
 
-def _validate_jax_syntax(
-    spec: _TaskSpec,
-    rewritten_class_src: str,
-    file_source_lines: list[str],
-) -> _ValidationResult:
-    """Syntax-only check for JAX mode.
-
-    JAX functions reject torch.Tensor inputs, so a full forward() execution
-    against captured PyTorch tensors is not possible. Instead we verify that
-    the rewritten source parses and compiles without errors.
-    """
-    try:
-        full_src = _inject_mode_imports(
-            _apply_replacements(
-                file_source_lines,
-                [(spec.line_start, spec.line_end, rewritten_class_src)],
-            ),
-            AnnotationMode.JAX,
-        )
-        compile(full_src, f"<{spec.class_name}>", "exec")
-        return _ValidationResult(True, "")
-    except SyntaxError:
-        return _ValidationResult(False, traceback.format_exc())
-
-
 def _validate_rewrite(
     spec: _TaskSpec,
     rewritten_class_src: str,
     file_source_lines: list[str],
     capture_entry: Optional[_CaptureEntry],
-    mode: AnnotationMode = AnnotationMode.EINSUM,
 ) -> _ValidationResult:
-    if mode is AnnotationMode.JAX:
-        return _validate_jax_syntax(spec, rewritten_class_src, file_source_lines)
-
     if capture_entry is None:
         return _ValidationResult(False, "no forward capture available for this class")
 
@@ -272,12 +165,11 @@ def _validate_rewrite(
         Path(tempfile.gettempdir()) / f"agent_shaper_{spec.class_name}_{uid}.py"
     )
     try:
-        full_src = _inject_mode_imports(
+        full_src = _inject_einops_import(
             _apply_replacements(
                 file_source_lines,
                 [(spec.line_start, spec.line_end, rewritten_class_src)],
             ),
-            mode,
         )
         temp_path.write_text(full_src)
 
@@ -330,9 +222,8 @@ async def _rewrite_class_with_validation(
     model: str,
     max_turns: int,
     pbar: tqdm,
-    mode: AnnotationMode = AnnotationMode.EINSUM,
 ) -> _ClassResult:
-    messages = _build_conversation_start(spec.class_src, mode)
+    messages = _build_conversation_start(spec.class_src)
     rewritten = spec.class_src
     passed = False
     turns_done = 0
@@ -341,7 +232,7 @@ async def _rewrite_class_with_validation(
         for turn in range(1, max_turns + 1):
             rewritten = await _rewrite_class_turn(client, messages, model)
             logger.info(f"{spec.class_name=}, {turn=}")
-            result = _validate_rewrite(spec, rewritten, file_source_lines, capture_entry, mode)
+            result = _validate_rewrite(spec, rewritten, file_source_lines, capture_entry)
             pbar.update(1)
             turns_done += 1
 
@@ -441,9 +332,6 @@ def _colored_diff(original: str, rewritten: str, filename: str) -> str:
 _EINOPS_IMPORT = "import einops\n"
 _EINOPS_NAMES = ("einops.",)
 
-_JAX_IMPORTS = ("import jax\n", "import jax.numpy as jnp\n")
-_JAX_NAMES = ("jnp.", "jax.")
-
 
 def _inject_imports_after_last(source: str, imports: tuple[str, ...]) -> str:
     """Insert each import line (if absent) after the last top-level import statement."""
@@ -465,18 +353,6 @@ def _inject_einops_import(source: str) -> str:
     if "from einops" in source or "import einops" in source:
         return source
     return _inject_imports_after_last(source, (_EINOPS_IMPORT,))
-
-
-def _inject_jax_imports(source: str) -> str:
-    if not any(name in source for name in _JAX_NAMES):
-        return source
-    return _inject_imports_after_last(source, _JAX_IMPORTS)
-
-
-def _inject_mode_imports(source: str, mode: AnnotationMode) -> str:
-    if mode is AnnotationMode.JAX:
-        return _inject_jax_imports(source)
-    return _inject_einops_import(source)
 
 
 def _apply_replacements(
@@ -503,7 +379,6 @@ async def llm_annotate_module_source(
     open_in_vscode: bool = True,
     tests_dir: Optional[str] = "tests",
     max_turns: int = 3,
-    mode: AnnotationMode = AnnotationMode.EINSUM,
 ) -> dict[str, str]:
     """Rewrite workspace nn.Module classes using an LLM with iterative validation.
 
@@ -575,7 +450,6 @@ async def llm_annotate_module_source(
                     model,
                     max_turns,
                     pbar,
-                    mode,
                 )
             )
             tasks.append(task)
@@ -593,7 +467,7 @@ async def llm_annotate_module_source(
         if src_lines is None:
             continue
         original = "".join(src_lines)
-        rewritten = _inject_mode_imports(_apply_replacements(src_lines, replacements), mode)
+        rewritten = _inject_einops_import(_apply_replacements(src_lines, replacements))
         result[src_file] = rewritten
 
         if show_diff:
@@ -645,9 +519,8 @@ if __name__ == "__main__":
             GPT(cfg),
             example_args,
             dim_names=dim_names,
-            output_dir="llm_annotated_output_jax",
+            output_dir="llm_annotated_output_einsum",
             show_diff=True,
-            mode=AnnotationMode.JAX
         )
 
     asyncio.run(main())
