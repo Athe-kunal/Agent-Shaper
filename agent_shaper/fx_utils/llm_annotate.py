@@ -91,40 +91,53 @@ CRITICAL: Your response must be the complete nn.Module class and nothing else.
 No explanation, no markdown fences, no prose before or after the class."""
 
 _SYSTEM_EINSUM = """\
-You are a PyTorch-to-einsum converter.
+You are a PyTorch tensor-operation moderniser.
 
 You will receive a Python nn.Module class that has inline shape comments, for example:
-    y = q @ k.transpose(-2, -1)  # y: (2, 2, 16, 16)
+    y = a @ b.transpose(-2, -1)  # y: (4, 8, 8)
 
 The numbers in the shapes are concrete dummy values from one example forward pass —
-they are NOT fixed constants. Always use descriptive index names that reflect what
-each dimension represents (e.g. b=batch, t=seq_len, h=n_head, d=head_dim).
+they are NOT fixed constants. Always use descriptive dimension names that reflect what
+each dimension represents (e.g. batch_size, in_features, out_features, num_groups).
 
-Your task — rewrite the entire nn.Module using einsum notation:
-1. Replace ALL explicit matrix multiplications, batched matmuls, and attention-style
-   operations (written with @, torch.matmul, torch.bmm, or equivalent) with
-   torch.einsum calls using descriptive index names.
+You have two tools. Use each for what it is best at:
+
+  torch.einsum  — for contractions: matmul, batched matmul, dot-product, outer product.
+  einops        — for everything structural: splitting/merging axes, permuting, repeating,
+                  reducing. Prefer einops.rearrange, einops.repeat, einops.reduce over
+                  view/reshape/transpose/expand/repeat wherever the intent is axis
+                  manipulation rather than numeric contraction.
+
+Your task:
+1. Replace ALL explicit matrix multiplications and tensor contractions
+   (written with @, torch.matmul, torch.bmm, or equivalent) with torch.einsum calls.
    Do NOT replace nn.Linear / nn.Embedding module calls — leave those as-is.
-2. Replace view/transpose/reshape sequences that reshape a tensor to split or merge
-   heads (e.g. view(B, T, n_head, d).transpose(1, 2) or the reverse) with the
-   equivalent einsum or a single contiguous().view() only where unavoidable.
-   Eliminate intermediate reshapes that exist solely to set up a matmul.
-3. For every torch.einsum call you produce, add an inline comment that states:
-   (a) the full descriptive name for every index letter used, e.g.:
-       b=batch_size, t=seq_len, h=n_head, d=head_dim, q=query_pos, k=key_pos,
-       v=vocab_size, o=out_features — use full words, not abbreviations, and
-   (b) a one-phrase description of what the operation computes, e.g.:
-       # b=batch_size, h=n_head, q=query_pos, k=key_pos, d=head_dim; scaled dot-product: (b,h,q,d) x (b,h,k,d) → (b,h,q,k)
-   Note: torch.einsum requires single-character subscripts in the equation string —
-   the full names belong only in the comment, not in the equation itself.
-4. Remove ALL raw-number shape annotations from every line in the class — including
-   lines you do not otherwise modify (e.g. gelu, dropout, embedding comments).
-   Replace any remaining shape hints with descriptive dimension names only.
-5. Everything that cannot be expressed as einsum (layer_norm, softmax, dropout,
-   activation functions, nn.Linear calls, embedding lookups) must be preserved
-   byte-for-byte. Add or update an inline comment on each such line showing the
-   output shape with descriptive dimension names (e.g. # (b, t, n_embd)).
+2. Replace view/reshape/transpose/expand/repeat sequences that split, merge, permute,
+   or tile axes with the appropriate einops call:
+     - axis split/merge/permute  → einops.rearrange
+     - repeat/tile along an axis → einops.repeat
+     - reduction (sum/mean/max)  → einops.reduce
+   Include named-axis sizes as keyword arguments where einops requires them
+   (e.g. einops.rearrange(x, 'b n (g d) -> b g n d', g=self.num_groups)).
+3. HARD CONSTRAINT — torch.einsum equation strings accept ONLY single letters [a-zA-Z].
+   Multi-character subscripts are ILLEGAL and raise a RuntimeError at runtime.
 
+   WRONG: torch.einsum('b in_features, out_features in_features -> b out_features', x, w)
+   RIGHT: torch.einsum('bi,oi->bo', x, w)  # b=batch_size, i=in_features, o=out_features; linear projection: (b,i) x (o,i) → (b,o)
+
+   For every torch.einsum call, add an inline comment that states:
+   (a) the full descriptive name for every single-letter index used, and
+   (b) a one-phrase description of what the operation computes, e.g.:
+       # b=batch_size, i=in_features, o=out_features; linear projection: (b,i) x (o,i) → (b,o)
+   For every einops call, add an inline comment describing the axis transformation, e.g.:
+       # split features into num_groups groups of group_dim each: (b,n,f) → (b,g,n,d)
+4. Remove ALL raw-number shape annotations from every line in the class — including
+   lines you do not otherwise modify. Replace any remaining shape hints with
+   descriptive dimension names only.
+5. Everything else (layer_norm, softmax, dropout, activation functions, nn.Linear
+   calls, embedding lookups) must be preserved byte-for-byte. Add or update an
+   inline comment on each such line showing the output shape with descriptive
+   dimension names (e.g. # (batch_size, num_tokens, hidden_dim)).
 CRITICAL: Your response must be the complete rewritten nn.Module class and nothing else.
 No explanation, no markdown fences, no prose before or after the class."""
 
@@ -179,10 +192,10 @@ def _validate_rewrite(
         Path(tempfile.gettempdir()) / f"agent_shaper_{spec.class_name}_{uid}.py"
     )
     try:
-        full_src = _apply_replacements(
+        full_src = _inject_einops_import(_apply_replacements(
             file_source_lines,
             [(spec.line_start, spec.line_end, rewritten_class_src)],
-        )
+        ))
         temp_path.write_text(full_src)
 
         mod_spec = importlib.util.spec_from_file_location(
@@ -342,6 +355,26 @@ def _colored_diff(original: str, rewritten: str, filename: str) -> str:
     return "".join(parts)
 
 
+_EINOPS_IMPORT = "import einops\n"
+_EINOPS_NAMES = ("einops.",)
+
+
+def _inject_einops_import(source: str) -> str:
+    """Insert the einops import after the last import line if einops is used."""
+    if not any(name in source for name in _EINOPS_NAMES):
+        return source
+    if "from einops" in source or "import einops" in source:
+        return source
+    lines = source.splitlines(keepends=True)
+    last_import = -1
+    for i, line in enumerate(lines):
+        if line.startswith("import ") or line.startswith("from "):
+            last_import = i
+    insert_at = last_import + 1 if last_import >= 0 else 0
+    lines.insert(insert_at, _EINOPS_IMPORT)
+    return "".join(lines)
+
+
 def _apply_replacements(
     source_lines: list[str],
     replacements: list[tuple[int, int, str]],
@@ -456,7 +489,7 @@ async def llm_annotate_module_source(
         if src_lines is None:
             continue
         original = "".join(src_lines)
-        rewritten = _apply_replacements(src_lines, replacements)
+        rewritten = _inject_einops_import(_apply_replacements(src_lines, replacements))
         result[src_file] = rewritten
 
         if show_diff:

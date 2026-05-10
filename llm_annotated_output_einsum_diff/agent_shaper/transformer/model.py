@@ -14,17 +14,18 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import einops
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))  # weight: (feature_dim)
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None  # bias: (feature_dim)
+        self.weight = nn.Parameter(torch.ones(ndim))  # weight: (normalized_dim)
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None  # bias: (normalized_dim)
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)  # layer_norm: (batch_size, seq_len, feature_dim)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)  # layer_norm: (batch_size, seq_len, normalized_dim)
 
 class CausalSelfAttention(nn.Module):
 
@@ -50,26 +51,26 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        b, t, c = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # (q, k, v): (b, t, 3*n_embd) → [(b, t, n_embd), (b, t, n_embd), (b, t, n_embd)] → (b, t, n_embd)
-        q = q.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
-        k = k.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
-        v = v.view(b, t, self.n_head, c // self.n_head).transpose(1, 2)  # (b, t, n_head, head_dim) → (b, n_head, t, head_dim)
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # (batch_size, seq_len, hidden_dim) -> 3*(batch_size, seq_len, hidden_dim_per_qkv) -> (batch_size, seq_len, hidden_dim_per_qkv)
+        k = einops.rearrange(k, 'b t (h d) -> b h t d', h=self.n_head)  # split hidden_dim_per_qkv into num_heads groups of head_dim: (batch_size, seq_len, hidden_dim) -> (batch_size, num_heads, seq_len, head_dim)
+        q = einops.rearrange(q, 'b t (h d) -> b h t d', h=self.n_head)  # split hidden_dim_per_qkv into num_heads groups of head_dim: (batch_size, seq_len, hidden_dim) -> (batch_size, num_heads, seq_len, head_dim)
+        v = einops.rearrange(v, 'b t (h d) -> b h t d', h=self.n_head)  # split hidden_dim_per_qkv into num_heads groups of head_dim: (batch_size, seq_len, hidden_dim) -> (batch_size, num_heads, seq_len, head_dim)
 
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)  # (b, n_head, t, head_dim)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)  # (batch_size, num_heads, seq_len, head_dim)
         else:
             # manual implementation of attention
-            att = torch.einsum('b h q d, b h k d -> b h q k', q, k) * (1.0 / math.sqrt(k.size(-1)))  # b=batch_size, h=n_head, q=query_pos, k=key_pos, d=head_dim; scaled dot-product: (b,h,q,d) x (b,h,k,d) → (b,h,q,k)
-            att = att.masked_fill(self.bias[:, :, :t, :t] == 0, float('-inf'))  # (b, n_head, t, t)
-            att = F.softmax(att, dim=-1)  # (b, n_head, t, t)
-            att = self.attn_dropout(att)  # (b, n_head, t, t)
-            y = torch.einsum('b h q k, b h k d -> b h q d', att, v)  # b=batch_size, h=n_head, q=query_pos, k=key_pos, d=head_dim; attention-weighted sum: (b,h,q,k) x (b,h,k,d) → (b,h,q,d)
+            att = torch.einsum('b h i d, b h j d -> b h i j', q, k) * (1.0 / math.sqrt(k.size(-1)))  # b=batch_size, h=num_heads, i=query_seq_pos, j=key_seq_pos, d=head_dim; scaled dot-product attention logits: (b,h,i,d) x (b,h,j,d) -> (b,h,i,j)
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))  # apply causal mask: (batch_size, num_heads, seq_len, seq_len)
+            att = F.softmax(att, dim=-1)  # (batch_size, num_heads, seq_len, seq_len)
+            att = self.attn_dropout(att)  # (batch_size, num_heads, seq_len, seq_len)
+            y = torch.einsum('b h i j, b h j d -> b h i d', att, v)  # b=batch_size, h=num_heads, i=query_seq_pos, j=key_seq_pos, d=head_dim; weighted sum of values: (b,h,i,j) x (b,h,j,d) -> (b,h,i,d)
 
-        y = y.transpose(1, 2).contiguous().view(b, t, c)  # (b, t, n_embd)
+        y = einops.rearrange(y, 'b h t d -> b t (h d)')  # merge num_heads and head_dim: (batch_size, num_heads, seq_len, head_dim) -> (batch_size, seq_len, hidden_dim)
         # output projection
-        y = self.resid_dropout(self.c_proj(y))  # (b, t, n_embd)
+        y = self.resid_dropout(self.c_proj(y))  # (batch_size, seq_len, hidden_dim) -> (batch_size, seq_len, hidden_dim)
         return y
 
 class MLP(nn.Module):
@@ -82,10 +83,10 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)  # x [linear.default]: (batch_size, seq_len, embd_dim)
-        x = self.gelu(x)  # x [gelu.default]: (batch_size, seq_len, embd_dim)
-        x = self.c_proj(x)  # x [linear.default]: (batch_size, seq_len, embd_dim)
-        x = self.dropout(x)  # x [dropout.default]: (batch_size, seq_len, embd_dim)
+        x = self.c_fc(x)  # (batch_size, num_tokens, hidden_dim) -> (batch_size, num_tokens, intermediate_dim)
+        x = self.gelu(x)  # (batch_size, num_tokens, intermediate_dim)
+        x = self.c_proj(x)  # (batch_size, num_tokens, intermediate_dim) -> (batch_size, num_tokens, hidden_dim)
+        x = self.dropout(x)  # (batch_size, num_tokens, hidden_dim)
         return x
 
 class Block(nn.Module):
@@ -98,8 +99,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))  # (b, t, n_embd) + (b, t, n_embd) -> (b, t, n_embd)
-        x = x + self.mlp(self.ln_2(x))  # (b, t, n_embd) + (b, t, n_embd) -> (b, t, n_embd)
+        x = x + self.attn(self.ln_1(x))  # (batch_size, seq_len, hidden_dim)
+        x = x + self.mlp(self.ln_2(x))  # (batch_size, seq_len, hidden_dim)
         return x
 
 @dataclass
@@ -134,10 +135,10 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -161,38 +162,25 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # (t)  # pos [arange.start]: (t)
+        batch_size, seq_len = idx.size()
+        assert seq_len <= self.config.block_size, f"Cannot forward sequence of length {seq_len}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, seq_len, dtype=torch.long, device=device)  # (seq_len,)  # pos indices [arange.start]: (seq_len)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)  # (b, t, n_embd)
+        tok_emb = self.transformer.wte(idx)  # (batch_size, seq_len, hidden_dim)
+        pos_emb = self.transformer.wpe(pos)  # (seq_len, hidden_dim)
+        x = self.transformer.drop(tok_emb + pos_emb)  # (batch_size, seq_len, hidden_dim)
         for block in self.transformer.h:
-            x = block(x)  # (b, t, n_embd)
-        x = self.transformer.ln_f(x)  # (b, t, n_embd)
+            x = block(x)
+        x = self.transformer.ln_f(x)  # (batch_size, seq_len, hidden_dim)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = torch.einsum(
-                'bte,ve->btv',
-                x,
-                self.lm_head.weight
-            )  # b=batch_size, t=seq_len, e=embedding_dim, v=vocab_size; linear projection: (b,t,e) x (v,e) -> (b,t,v)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1
-            )  # loss: (b*t, vocab_size) -> (b*t) -> ()
+            logits = self.lm_head(x)  # (batch_size, seq_len, vocab_size)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)  # (batch_size*seq_len, vocab_size) → (batch_size*seq_len) → ()
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            x_last = x[:, [-1], :]  # (b, 1, n_embd)
-            logits = torch.einsum(
-                'bte,ve->btv',
-                x_last,
-                self.lm_head.weight
-            )  # b=batch_size, t=seq_len_last_step, e=embedding_dim, v=vocab_size; linear projection: (b,1,e) x (v,e) -> (b,1,v)
+            logits = self.lm_head(x[:, [-1], :])  # (batch_size, 1, vocab_size)  # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -206,12 +194,12 @@ class GPT(nn.Module):
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
+        override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
@@ -219,15 +207,15 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
-        config_args['bias'] = True  # always True for GPT model checkpoints
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
@@ -237,7 +225,7 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -245,8 +233,8 @@ class GPT(nn.Module):
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
@@ -297,13 +285,13 @@ class GPT(nn.Module):
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
-        flops_per_token = 6 * N + 12 * L * H * Q * T
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
@@ -318,18 +306,18 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond)  # (batch_size, seq_len_cond, vocab_size)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature  # (b, vocab_size)
+            logits = logits[:, -1, :] / temperature  # (batch_size, vocab_size)
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))  # (b, top_k)
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))  # (batch_size, top_k)
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)  # (b, vocab_size)
+            probs = F.softmax(logits, dim=-1)  # (batch_size, vocab_size)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (b, 1)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)  # (b, t+1)
+            idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, seq_len + 1)
 
         return idx
