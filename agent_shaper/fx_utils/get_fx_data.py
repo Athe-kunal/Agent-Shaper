@@ -1,8 +1,9 @@
 """
-get_fx_data.py — per-module tensor shape metadata for workspace nn.Module classes.
+get_fx_data.py — per-module and per-function tensor shape metadata for workspace code.
 
-Uses torch.export + ShapeProp to capture every intermediate tensor transformation
-inside each module's forward pass, not just the inputs.
+Uses torch.export + ShapeProp to capture every intermediate tensor transformation.
+Standalone workspace functions are detected by parsing call-site source lines, because
+torch.export inlines them and only records the call site in each node's stack_trace.
 """
 
 from __future__ import annotations
@@ -39,6 +40,19 @@ class ModuleInfo(NamedTuple):
     tensors: list      # list[TensorInfo] — every intermediate FX node in forward
 
 
+class FunctionInfo(NamedTuple):
+    func_name: str
+    source_file: Optional[str]
+    line_start: Optional[int]
+    line_end: Optional[int]
+    tensors: list      # list[TensorInfo] — FX nodes attributed to this function
+
+
+class ShapeResult(NamedTuple):
+    modules: list    # list[ModuleInfo]
+    functions: list  # list[FunctionInfo]
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _is_workspace_cls(cls: type, workspace: str) -> bool:
@@ -56,7 +70,6 @@ def _innermost_workspace_origin(node, workspace, path_to_module):
         if not (isinstance(val, tuple) and len(val) == 2):
             continue
         qual_path, cls_or_str = val
-        # torch.export encodes stack as (str_path, str_classname)
         if isinstance(qual_path, str) and isinstance(cls_or_str, str):
             mod = path_to_module.get(qual_path)
             if mod is not None:
@@ -66,6 +79,65 @@ def _innermost_workspace_origin(node, workspace, path_to_module):
         elif isinstance(cls_or_str, type) and _is_workspace_cls(cls_or_str, workspace):
             return qual_path, cls_or_str
     return None, None
+
+
+def _node_callsite(node, workspace: str):
+    """Return (abs_file, line_no) of the innermost workspace frame in stack_trace."""
+    trace = node.meta.get("stack_trace", "")
+    if not trace:
+        return None, None
+    for f, line in reversed(re.findall(r'File "([^"]+)", line (\d+)', trace)):
+        abs_f = os.path.abspath(f)
+        if abs_f.startswith(workspace) and "site-packages" not in abs_f:
+            return abs_f, int(line)
+    return None, None
+
+
+def _build_workspace_func_registry(workspace: str) -> dict[str, list[tuple]]:
+    """Return {func_name: [(abs_file, rel_file, line_start, line_end)]} for all top-level workspace functions."""
+    registry: dict[str, list[tuple]] = defaultdict(list)
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".") and d not in ("__pycache__", "venv")
+            and "site-packages" not in os.path.join(root, d)
+        ]
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            abs_f = os.path.join(root, fname)
+            if "site-packages" in abs_f:
+                continue
+            try:
+                with open(abs_f) as fh:
+                    src = fh.read()
+                tree = ast.parse(src)
+                rel_f = os.path.relpath(abs_f)
+                for child in ast.iter_child_nodes(tree):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        registry[child.name].append((abs_f, rel_f, child.lineno, child.end_lineno))
+            except (OSError, SyntaxError):
+                continue
+    return dict(registry)
+
+
+def _free_func_names_at_line(src_lines: list[str], line_no: int) -> list[str]:
+    """Return names of all free-function calls (not method calls) on the given source line."""
+    if line_no <= 0 or line_no > len(src_lines):
+        return []
+    line = src_lines[line_no - 1].strip()
+    try:
+        tree = ast.parse(line, mode="eval")
+    except SyntaxError:
+        try:
+            tree = ast.parse(line, mode="exec")
+        except SyntaxError:
+            return []
+    return [
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
 
 
 def _node_shape(node):
@@ -128,7 +200,7 @@ def _cls_varnames(cls, class_start: Optional[int]) -> dict[int, str]:
     except (OSError, TypeError, SyntaxError):
         return {}
 
-    offset = class_start - 1  # AST lineno is 1-based within the extracted source
+    offset = class_start - 1
     result: dict[int, str] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -151,7 +223,6 @@ def _cls_varnames(cls, class_start: Optional[int]) -> dict[int, str]:
 
 
 def _build_val_to_names(dim_names: dict[str, int]) -> dict[int, list[str]]:
-    """Invert {name: value} → {value: [names]}, preserving insertion order."""
     result: dict[int, list[str]] = defaultdict(list)
     for name, val in dim_names.items():
         result[val].append(name)
@@ -159,14 +230,21 @@ def _build_val_to_names(dim_names: dict[str, int]) -> dict[int, list[str]]:
 
 
 def _annotate(shape, val_to_names: dict[int, list[str]]) -> Optional[str]:
-    """Return a symbolic shape string, e.g. '(B, T, n_embd)'.
-    Ambiguous dims (same value, multiple names) are shown as 'B/n_head'."""
+    """Return a symbolic shape string, e.g. '(B, T, n_embd)'."""
     if shape is None or not val_to_names:
         return None
     if isinstance(shape, list):
         return f"[{', '.join(_annotate(s, val_to_names) or '?' for s in shape)}]"
     parts = ["/".join(val_to_names[d]) if d in val_to_names else str(d) for d in shape]
     return f"({', '.join(parts)})"
+
+
+def _hashable_shape(shape):
+    if shape is None:
+        return None
+    if isinstance(shape, list):
+        return tuple(tuple(s) if s is not None else None for s in shape)
+    return shape
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -176,15 +254,18 @@ def get_module_shapes(
     example_args: tuple,
     workspace: Optional[str] = None,
     dim_names: Optional[dict[str, int]] = None,
-) -> list[ModuleInfo]:
+) -> ShapeResult:
     """
     Parameters
     ----------
     dim_names:
-        Optional ``{name: value}`` mapping for symbolic shape annotation, e.g.
-        ``{"B": 2, "T": 16, "C": 64}``.  When a value is shared by multiple
-        names (e.g. ``{"B": 2, "n_head": 2}``), the annotation shows ``B/n_head``.
-        Raw integer shapes are always preserved in ``TensorInfo.shape``.
+        Optional ``{name: value}`` mapping for symbolic shape annotation.
+
+    Returns
+    -------
+    ShapeResult
+        .modules   — one ModuleInfo per unique workspace nn.Module in the graph
+        .functions — one FunctionInfo per unique workspace standalone function in the graph
     """
     workspace = workspace or os.getcwd()
     module = module.eval()
@@ -195,18 +276,33 @@ def get_module_shapes(
     gm = exported.module()
     ShapeProp(gm).propagate(*example_args)
 
-    meta_cache: dict[type, tuple] = {}
+    # Build a registry of top-level workspace functions once.
+    # torch.export inlines functions so their body never appears in stack_trace;
+    # instead we detect them by parsing the call-site line.
+    func_registry = _build_workspace_func_registry(workspace)
+    src_line_cache: dict[str, list[str]] = {}  # abs_file -> source lines
 
-    def get_meta(cls):
-        if cls not in meta_cache:
+    cls_meta_cache: dict[type, tuple] = {}
+
+    def get_cls_meta(cls):
+        if cls not in cls_meta_cache:
             src_lines, start, end, src_file, abs_file = _cls_meta(cls)
             varnames = _cls_varnames(cls, start)
-            meta_cache[cls] = (src_lines, start, end, src_file, abs_file, varnames)
-        return meta_cache[cls]
+            cls_meta_cache[cls] = (src_lines, start, end, src_file, abs_file, varnames)
+        return cls_meta_cache[cls]
 
-    # Group FX nodes by (origin_path, cls), preserving first-seen order
-    seen_keys: list[tuple] = []
-    key_to_tensors: dict[tuple, list[TensorInfo]] = {}
+    def get_src_lines(abs_file: str) -> list[str]:
+        if abs_file not in src_line_cache:
+            try:
+                with open(abs_file) as fh:
+                    src_line_cache[abs_file] = fh.readlines()
+            except OSError:
+                src_line_cache[abs_file] = []
+        return src_line_cache[abs_file]
+
+    # ── Pass 1: group FX nodes by workspace nn.Module ──────────────────────────
+    mod_seen_keys: list[tuple] = []
+    mod_key_to_tensors: dict[tuple, list[TensorInfo]] = {}
 
     for node in gm.graph.nodes:
         origin, cls = _innermost_workspace_origin(node, workspace, path_to_module)
@@ -214,7 +310,7 @@ def get_module_shapes(
             continue
         key = (origin, cls)
         shape, dtype = _node_shape(node)
-        src_lines, start, end, src_file, abs_file, varnames = get_meta(cls)
+        src_lines, start, end, src_file, abs_file, varnames = get_cls_meta(cls)
         line_no = _node_line(node, abs_file)
         var = varnames.get(line_no) if line_no is not None else None
         tensor_name = f"{var} [{_node_op_name(node)}]" if var is not None else node.name
@@ -226,30 +322,22 @@ def get_module_shapes(
             source_file=src_file,
             line_number=line_no,
         )
-        if key not in key_to_tensors:
-            seen_keys.append(key)
-            key_to_tensors[key] = []
-        key_to_tensors[key].append(t)
+        if key not in mod_key_to_tensors:
+            mod_seen_keys.append(key)
+            mod_key_to_tensors[key] = []
+        mod_key_to_tensors[key].append(t)
 
-    # Deduplicate: same class + identical shape sequence = same module configuration
-    result: list[ModuleInfo] = []
-    seen_dedup: set[tuple] = set()
+    modules: list[ModuleInfo] = []
+    mod_seen_dedup: set[tuple] = set()
 
-    for (origin, cls) in seen_keys:
-        tensors = key_to_tensors[(origin, cls)]
-        def _hashable(shape):
-            if shape is None:
-                return None
-            if isinstance(shape, list):
-                return tuple(tuple(s) if s is not None else None for s in shape)
-            return shape
-
-        dedup_key = (cls.__name__, tuple(_hashable(t.shape) for t in tensors))
-        if dedup_key in seen_dedup:
+    for (origin, cls) in mod_seen_keys:
+        tensors = mod_key_to_tensors[(origin, cls)]
+        dedup_key = (cls.__name__, tuple(_hashable_shape(t.shape) for t in tensors))
+        if dedup_key in mod_seen_dedup:
             continue
-        seen_dedup.add(dedup_key)
+        mod_seen_dedup.add(dedup_key)
 
-        src_lines, start, end, src_file, abs_file, varnames = get_meta(cls)
+        src_lines, start, end, src_file, abs_file, varnames = get_cls_meta(cls)
         mod = path_to_module.get(origin, None)
         params = []
         if mod is not None:
@@ -265,7 +353,7 @@ def get_module_shapes(
                 for name, p in mod.named_parameters(recurse=False)
             ]
 
-        result.append(ModuleInfo(
+        modules.append(ModuleInfo(
             class_name=cls.__name__,
             module_origin=origin or "root",
             source_file=src_file,
@@ -275,7 +363,64 @@ def get_module_shapes(
             tensors=tensors,
         ))
 
-    return result
+    # ── Pass 2: attribute FX nodes to workspace standalone functions ────────────
+    # torch.export inlines standalone functions, so stack_trace only records the
+    # call site in forward(). We parse that line to find which workspace function
+    # is being called, then group nodes by function.
+    func_seen_keys: list[tuple] = []
+    func_key_to_tensors: dict[tuple, list[TensorInfo]] = {}
+    func_key_meta: dict[tuple, tuple] = {}  # (abs_file, func_name) -> (rel_file, line_start, line_end)
+
+    for node in gm.graph.nodes:
+        call_abs_file, call_line_no = _node_callsite(node, workspace)
+        if call_abs_file is None:
+            continue
+
+        src_lines = get_src_lines(call_abs_file)
+        called_names = _free_func_names_at_line(src_lines, call_line_no)
+
+        for func_name in called_names:
+            if func_name not in func_registry:
+                continue
+            for abs_func_file, rel_func_file, line_start, line_end in func_registry[func_name]:
+                key = (abs_func_file, func_name)
+                if key not in func_key_meta:
+                    func_key_meta[key] = (rel_func_file, line_start, line_end)
+
+                shape, dtype = _node_shape(node)
+                t = TensorInfo(
+                    name=node.name,
+                    shape=shape,
+                    annotated_shape=_annotate(shape, val_to_names),
+                    dtype=dtype,
+                    source_file=rel_func_file,
+                    line_number=None,  # inlined — exact body line not available
+                )
+                if key not in func_key_to_tensors:
+                    func_seen_keys.append(key)
+                    func_key_to_tensors[key] = []
+                func_key_to_tensors[key].append(t)
+
+    functions: list[FunctionInfo] = []
+    func_seen_dedup: set[tuple] = set()
+
+    for (abs_func_file, func_name) in func_seen_keys:
+        tensors = func_key_to_tensors[(abs_func_file, func_name)]
+        dedup_key = (func_name, abs_func_file, tuple(_hashable_shape(t.shape) for t in tensors))
+        if dedup_key in func_seen_dedup:
+            continue
+        func_seen_dedup.add(dedup_key)
+
+        rel_file, line_start, line_end = func_key_meta[(abs_func_file, func_name)]
+        functions.append(FunctionInfo(
+            func_name=func_name,
+            source_file=rel_file,
+            line_start=line_start,
+            line_end=line_end,
+            tensors=tensors,
+        ))
+
+    return ShapeResult(modules=modules, functions=functions)
 
 
 # ─── CLI smoke-test ───────────────────────────────────────────────────────────
@@ -299,14 +444,12 @@ if __name__ == "__main__":
         torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
     )
 
-    # Supply whatever symbolic names are meaningful for your model.
-    # Ambiguous values (e.g. B==n_head==2) are shown as "B/n_head".
     dim_names = {"B": B, "T": T}
 
-    groups = get_module_shapes(GPT(cfg), example_args, dim_names=dim_names)
+    result = get_module_shapes(GPT(cfg), example_args, dim_names=dim_names)
 
     SEP = "═" * 80
-    for g in groups:
+    for g in result.modules:
         print(f"\n{SEP}")
         print(f"  {g.class_name}  [{g.module_origin}]  L{g.line_start}–L{g.line_end}  {g.source_file}")
         print(SEP)
@@ -320,3 +463,11 @@ if __name__ == "__main__":
             for t in g.tensors:
                 ann = f"  {t.annotated_shape}" if t.annotated_shape else ""
                 print(f"    {t.name:<28}  shape={t.shape}{ann}  {t.source_file}:L{t.line_number}")
+
+    for f in result.functions:
+        print(f"\n{SEP}")
+        print(f"  fn {f.func_name}  L{f.line_start}–L{f.line_end}  {f.source_file}")
+        print(SEP)
+        for t in f.tensors:
+            ann = f"  {t.annotated_shape}" if t.annotated_shape else ""
+            print(f"    {t.name:<28}  shape={t.shape}{ann}  {t.source_file}:L{t.line_number}")

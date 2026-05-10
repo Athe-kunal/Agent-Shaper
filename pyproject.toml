@@ -7,8 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     "debugpy>=1.8.20",
     "einops>=0.8.2",
+    "fastmcp>=3.2.4",
     "jax>=0.10.0",
     "loguru>=0.7.3",
+    "mcp[cli]>=1.27.1",
     "numpy>=2.4.4",
     "openai>=2.34.0",
     "streamlit>=1.57.0",
