@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import ast
+import copy
+import importlib.util
+import io
 import os
 import sys
+import tempfile
 import textwrap
 import traceback
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
+from pathlib import Path
 from typing import Optional
+
+import torch
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import torch.nn as nn
 from mcp.server.fastmcp import FastMCP
@@ -15,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from agent_shaper.fx_utils.get_fx_data import FunctionInfo, ModuleInfo, TensorInfo, get_module_shapes
 from agent_shaper.fx_utils.llm_annotate import _TaskSpec, _validate_rewrite
 from agent_shaper.fx_utils.manual_annotate import _annotate_source_lines, _build_line_map
-from agent_shaper.fx_utils.test_generator import _run_capture_indexed
+from agent_shaper.fx_utils.test_generator import _run_capture_indexed, _save_fixtures
 
 mcp = FastMCP("agent-shaper-fx")
 
@@ -41,7 +54,7 @@ Rewrite workflow — follow these steps in order for every nn.Module or function
 Never skip step 3. A rewrite that has not passed `validate_rewrite` must not be
 presented to the user as a finished result."""
 
-_WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_WORKSPACE = _REPO_ROOT
 
 
 def _format_tensor(t: TensorInfo, indent: str = "    ") -> str:
@@ -129,6 +142,88 @@ def _run_fx(script: str):
         return f"FX shape extraction failed:\n{traceback.format_exc()}", None, None, None
 
     return None, model, example_args, shape_result
+
+
+def _build_dep_order(modules: list) -> list[str]:
+    """Return unique class names in topological order: leaves first, composites last.
+
+    Uses module origin paths to infer containment: if origin_B starts with origin_A,
+    then A contains B and must be rewritten after B.
+    """
+    class_origins: dict[str, list[str]] = defaultdict(list)
+    seen_classes: list[str] = []
+    for m in modules:
+        origin = "" if m.module_origin == "root" else m.module_origin
+        if m.class_name not in class_origins:
+            seen_classes.append(m.class_name)
+        class_origins[m.class_name].append(origin)
+
+    # deps[A] = classes that A depends on (must be rewritten before A)
+    deps: dict[str, set[str]] = {cls: set() for cls in seen_classes}
+    for cls_a in seen_classes:
+        for oa in class_origins[cls_a]:
+            for cls_b in seen_classes:
+                if cls_a == cls_b:
+                    continue
+                for ob in class_origins[cls_b]:
+                    if (oa == "" and ob != "") or (oa and ob.startswith(oa + ".")):
+                        deps[cls_a].add(cls_b)
+
+    in_degree = {cls: len(deps[cls]) for cls in seen_classes}
+    dependents: dict[str, list[str]] = {cls: [] for cls in seen_classes}
+    for cls, ds in deps.items():
+        for d in ds:
+            dependents[d].append(cls)
+
+    queue: deque[str] = deque(cls for cls in seen_classes if in_degree[cls] == 0)
+    order: list[str] = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for dep in dependents[node]:
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                queue.append(dep)
+    order.extend(cls for cls in seen_classes if cls not in set(order))
+    return order
+
+
+def _ensure_einops_imports(file_src: str, class_src: str) -> str:
+    """Inject missing einops imports into file_src based on names used in class_src."""
+    needs_rearrange = "rearrange" in class_src and "from einops import rearrange" not in file_src
+    needs_esum = "esum" in class_src and "einsum as esum" not in file_src
+    needs_einsum = (
+        "einsum" in class_src
+        and "einsum as esum" not in file_src
+        and "from einops import einsum" not in file_src
+    )
+
+    inject: list[str] = []
+    if needs_rearrange:
+        inject.append("from einops import rearrange\n")
+    if needs_esum:
+        inject.append("from einops import einsum as esum\n")
+    elif needs_einsum:
+        inject.append("from einops import einsum\n")
+
+    if not inject:
+        return file_src
+
+    lines = file_src.splitlines(keepends=True)
+    last_import_idx = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            last_import_idx = i
+    return "".join(lines[: last_import_idx + 1] + inject + lines[last_import_idx + 1 :])
+
+
+def _clone_module(sub_module: nn.Module) -> nn.Module:
+    """Clone a module via torch.save/load to avoid deepcopy failures on non-leaf tensors."""
+    buf = io.BytesIO()
+    torch.save(sub_module, buf)
+    buf.seek(0)
+    return torch.load(buf, weights_only=False)
 
 
 @mcp.tool()
@@ -234,6 +329,10 @@ def get_annotated_sources(
     if not modules and not functions:
         return "No workspace modules or functions found in the specified files."
 
+    # Dependency order header — always derived from the full traced graph, not just
+    # the requested files, so composite classes that span files are ordered correctly.
+    dep_order = _build_dep_order(shape_result.modules)
+
     # Read and annotate each relevant source file once.
     file_annotated_lines: dict[str, list[str]] = {}
     all_src_files = (
@@ -288,7 +387,9 @@ def get_annotated_sources(
             f"{snippet}"
         )
 
-    return "\n".join(sections)
+    dep_lines = "\n".join(f"  {i+1}. {cls}" for i, cls in enumerate(dep_order))
+    header = f"Rewrite order (leaves → composites — rewrite top-to-bottom):\n{dep_lines}"
+    return header + "\n\n" + "\n".join(sections)
 
 
 @mcp.tool()
@@ -338,18 +439,320 @@ def validate_rewrite(
     except OSError:
         return f"Could not read source file: {target.source_file}"
 
-    spec = _TaskSpec(
-        src_file=target.source_file,
-        line_start=target.line_start,
-        line_end=target.line_end,
-        class_name=class_name,
-        class_src=rewritten_class_src,
+    # Splice the rewritten class into the original file so its existing imports are
+    # preserved, then inject any missing einops imports.
+    rewrite_lines = rewritten_class_src.splitlines(keepends=True)
+    if rewrite_lines and not rewrite_lines[-1].endswith("\n"):
+        rewrite_lines[-1] += "\n"
+    patched_lines = (
+        file_source_lines[: target.line_start - 1]
+        + rewrite_lines
+        + file_source_lines[target.line_end :]
     )
-    result = _validate_rewrite(spec, rewritten_class_src, file_source_lines, capture_entry)
+    patched_src = _ensure_einops_imports("".join(patched_lines), rewritten_class_src)
 
-    if result.passed:
+    uid = uuid.uuid4().hex[:8]
+    temp_path = Path(tempfile.gettempdir()) / f"agent_shaper_cls_{uid}.py"
+    try:
+        temp_path.write_text(patched_src)
+        mod_spec = importlib.util.spec_from_file_location(f"_tmp_cls_{uid}", temp_path)
+        tmp_mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(tmp_mod)
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        return f"FAIL: Could not load patched file:\n{traceback.format_exc()}"
+
+    rewritten_cls = getattr(tmp_mod, class_name, None)
+    temp_path.unlink(missing_ok=True)
+    if rewritten_cls is None:
+        return f"FAIL: Class '{class_name}' not found in patched module."
+
+    def _close(a, b, atol: float = 1e-5) -> bool:
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return torch.allclose(a.float(), b.float(), atol=atol)
+        if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+            return all(_close(x, y, atol) for x, y in zip(a, b) if x is not None and y is not None)
+        return True
+
+    try:
+        test_mod = _clone_module(capture_entry.sub_module)
+        test_mod.__class__ = rewritten_cls
+        test_mod.eval()
+        with torch.no_grad():
+            actual = test_mod(*capture_entry.input_args)
+    except Exception:
+        return f"FAIL: Forward pass raised:\n{traceback.format_exc()}"
+
+    if _close(actual, capture_entry.output):
         return f"PASS: '{class_name}' rewrite produces identical outputs (atol=1e-5)."
-    return f"FAIL: {result.error_msg}"
+    return f"FAIL: '{class_name}' outputs differ beyond atol=1e-5."
+
+
+@mcp.tool()
+def validate_file_rewrite(
+    script: str,
+    rewritten_file_src: str,
+) -> str:
+    """Validate all nn.Module classes in a rewritten file against original outputs in one call.
+
+    Parses rewritten_file_src, finds every class that matches a traced workspace module,
+    validates each against captured forward() outputs, and returns a pass/fail summary.
+
+    The script must assign:
+      - `model`       : an nn.Module instance to trace
+      - `example_args`: a tuple of example tensors matching the model's forward signature
+      - `dim_names`   : (optional) dict mapping symbolic dim names to integer values
+
+    Args:
+        script: Python source that sets up model, example_args, and optionally dim_names.
+        rewritten_file_src: Complete source of the rewritten file (all classes included).
+
+    Returns:
+        Summary table of class names with PASS / FAIL status, and a totals line.
+    """
+    error, model, example_args, shape_result = _run_fx(script)
+    if error:
+        return error
+
+    try:
+        ast.parse(rewritten_file_src)
+    except SyntaxError as exc:
+        return f"Syntax error in rewritten file: {exc}"
+
+    capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
+    known_classes = {m.class_name for m in shape_result.modules}
+
+    # Load the entire rewritten file as a temp module so its own imports are preserved.
+    # This avoids the problem of splicing a class that uses aliased einops names (esum,
+    # rearrange) into the original file, which lacks those imports.
+    uid = uuid.uuid4().hex[:8]
+    temp_path = Path(tempfile.gettempdir()) / f"agent_shaper_file_{uid}.py"
+    try:
+        temp_path.write_text(rewritten_file_src)
+        mod_spec = importlib.util.spec_from_file_location(f"_tmp_file_{uid}", temp_path)
+        tmp_mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(tmp_mod)
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        return f"Failed to load rewritten file: {exc}"
+
+    def _close(a, b, atol: float = 1e-5) -> bool:
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return torch.allclose(a.float(), b.float(), atol=atol)
+        if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+            return all(_close(x, y, atol) for x, y in zip(a, b) if x is not None and y is not None)
+        return True
+
+    rows: list[str] = []
+    for class_name in _build_dep_order(shape_result.modules):
+        if class_name not in known_classes or not hasattr(tmp_mod, class_name):
+            continue
+        entry = capture_map.get(class_name)
+        if entry is None:
+            rows.append(f"  {class_name:<28} SKIP  (no forward capture)")
+            continue
+        try:
+            rewritten_cls = getattr(tmp_mod, class_name)
+            test_mod = _clone_module(entry.sub_module)
+            test_mod.__class__ = rewritten_cls
+            test_mod.eval()
+            with torch.no_grad():
+                actual = test_mod(*entry.input_args)
+            if _close(actual, entry.output):
+                rows.append(f"  {class_name:<28} PASS")
+            else:
+                rows.append(f"  {class_name:<28} FAIL  outputs differ beyond atol=1e-5")
+        except Exception:
+            first_line = traceback.format_exc().strip().splitlines()[-1]
+            rows.append(f"  {class_name:<28} FAIL  {first_line}")
+
+    temp_path.unlink(missing_ok=True)
+
+    if not rows:
+        return "No matching workspace nn.Module classes found in rewritten file."
+
+    passed = sum(1 for r in rows if " PASS" in r)
+    total = len(rows)
+    return f"Results ({passed}/{total} passed):\n" + "\n".join(rows)
+
+
+@mcp.tool()
+def save_fixtures(
+    script: str,
+    class_names: list[str],
+    tests_dir: str = "tests",
+) -> str:
+    """Capture and save forward() fixtures for specified nn.Module classes.
+
+    Runs the model, hooks into each class's forward(), and saves three files per class:
+      {tests_dir}/{src_stem}/fixtures/{ClassName}/module.pt  — serialised sub-module
+      {tests_dir}/{src_stem}/fixtures/{ClassName}/input.pt   — captured forward() inputs
+      {tests_dir}/{src_stem}/fixtures/{ClassName}/output.pt  — captured forward() outputs
+
+    These fixtures are consumed by tests generated with generate_test_files.
+
+    The script must assign:
+      - `model`       : an nn.Module instance to trace
+      - `example_args`: a tuple of example tensors matching the model's forward signature
+
+    Args:
+        script: Python source that sets up model and example_args.
+        class_names: List of nn.Module class names to capture fixtures for.
+        tests_dir: Root test directory (default "tests").
+
+    Returns:
+        List of fixture paths written, and any class names that could not be captured.
+    """
+    error, model, example_args, shape_result = _run_fx(script)
+    if error:
+        return error
+
+    capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
+    class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
+
+    saved: list[str] = []
+    missing: list[str] = []
+    for class_name in class_names:
+        entry = capture_map.get(class_name)
+        src_file = class_to_src.get(class_name)
+        if entry is None or src_file is None:
+            missing.append(class_name)
+            continue
+        _save_fixtures(entry, tests_dir, src_file)
+        stem = Path(src_file).stem
+        saved.append(f"  {class_name:<28} → {tests_dir}/{stem}/fixtures/{class_name}/")
+
+    lines: list[str] = []
+    if saved:
+        lines.append("Saved fixtures:")
+        lines.extend(saved)
+    if missing:
+        lines.append("Not found in traced graph (skipped):")
+        lines.extend(f"  {n}" for n in missing)
+    return "\n".join(lines) if lines else "No classes processed."
+
+
+def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
+    """Generate pytest file content that validates class_name against saved fixtures."""
+    lower = class_name.lower()
+    return textwrap.dedent(f"""\
+        \"\"\"Auto-generated: validates rewrite of {class_name}.\"\"\"
+        from __future__ import annotations
+
+        import importlib.util
+        from pathlib import Path
+
+        import torch
+
+        _FIXTURE_DIR = Path(__file__).parent / "fixtures" / {repr(class_name)}
+        _REWRITTEN_SRC = Path({repr(rewritten_abs_path)})
+        _CLASS_NAME = {repr(class_name)}
+
+
+        def _load_rewritten_class():
+            spec = importlib.util.spec_from_file_location("_rewritten_{lower}", _REWRITTEN_SRC)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return getattr(mod, _CLASS_NAME)
+
+
+        def _outputs_close(a, b, atol: float = 1e-5) -> bool:
+            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                return torch.allclose(a.float(), b.float(), atol=atol)
+            if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+                return all(
+                    _outputs_close(x, y, atol)
+                    for x, y in zip(a, b)
+                    if x is not None and y is not None
+                )
+            return True
+
+
+        def test_{lower}_rewrite_matches_original():
+            original_module = torch.load(_FIXTURE_DIR / "module.pt", weights_only=False)
+            input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
+            expected_output = torch.load(_FIXTURE_DIR / "output.pt", weights_only=False)
+
+            rewritten_cls = _load_rewritten_class()
+            original_module.__class__ = rewritten_cls
+
+            original_module.eval()
+            with torch.no_grad():
+                actual_output = original_module(*input_args)
+
+            assert _outputs_close(actual_output, expected_output), (
+                f"Rewrite of {{_CLASS_NAME}} produces different outputs. "
+                "Check the rewritten forward() for correctness."
+            )
+    """)
+
+
+@mcp.tool()
+def generate_test_files(
+    script: str,
+    class_names: list[str],
+    rewritten_src_file: str,
+    tests_dir: str = "tests",
+) -> str:
+    """Generate pytest test files that validate rewritten classes against saved fixtures.
+
+    For each class_name, writes a test file at:
+      {tests_dir}/{orig_src_stem}/test_rewrite_{classname}.py
+
+    The test loads the class from rewritten_src_file (resolved to an absolute path),
+    swaps it into the fixture module, and asserts output identity. Run save_fixtures
+    first to create the fixture files the tests depend on.
+
+    The script must assign:
+      - `model`       : an nn.Module instance to trace
+      - `example_args`: a tuple of example tensors matching the model's forward signature
+
+    Args:
+        script: Python source that sets up model and example_args.
+        class_names: List of nn.Module class names to generate tests for.
+        rewritten_src_file: Relative or absolute path to the rewritten source file.
+        tests_dir: Root test directory (default "tests").
+
+    Returns:
+        List of test file paths written, and any class names not found in the traced graph.
+    """
+    error, model, example_args, shape_result = _run_fx(script)
+    if error:
+        return error
+
+    rewritten_abs = os.path.abspath(rewritten_src_file)
+    if not os.path.exists(rewritten_abs):
+        return f"Rewritten source file not found: {rewritten_abs}"
+
+    class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
+
+    written: list[str] = []
+    missing: list[str] = []
+    for class_name in class_names:
+        src_file = class_to_src.get(class_name)
+        if src_file is None:
+            missing.append(class_name)
+            continue
+        stem = Path(src_file).stem
+        test_dir = Path(tests_dir) / stem
+        test_dir.mkdir(parents=True, exist_ok=True)
+        content = _mcp_test_content(class_name, rewritten_abs)
+        test_path = test_dir / f"test_rewrite_{class_name.lower()}.py"
+        test_path.write_text(content)
+        written.append(f"  {class_name:<28} → {test_path}")
+
+    lines: list[str] = []
+    if written:
+        lines.append("Generated test files:")
+        lines.extend(written)
+        lines.append(
+            f"\nExpected fixture layout:  {tests_dir}/{{src_stem}}/fixtures/{{ClassName}}/[module|input|output].pt"
+        )
+        lines.append("Run save_fixtures first if fixtures do not exist yet.")
+    if missing:
+        lines.append("Not found in traced graph (skipped):")
+        lines.extend(f"  {n}" for n in missing)
+    return "\n".join(lines) if lines else "No classes processed."
 
 
 if __name__ == "__main__":

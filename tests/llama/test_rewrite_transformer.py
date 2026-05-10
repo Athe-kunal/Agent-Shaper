@@ -1,4 +1,4 @@
-"""Auto-generated: validates rewrite of GPT."""
+"""Auto-generated: validates rewrite of Transformer."""
 from __future__ import annotations
 
 import importlib.util
@@ -6,13 +6,13 @@ from pathlib import Path
 
 import torch
 
-_FIXTURE_DIR = Path(__file__).parent / "fixtures" / 'GPT'
-_REWRITTEN_SRC = Path('/Users/athekunal/DEV/Agent-Shaper/agent_shaper/transformer/model_einsum.py')
-_CLASS_NAME = 'GPT'
+_FIXTURE_DIR = Path(__file__).parent / "fixtures" / 'Transformer'
+_REWRITTEN_SRC = Path('/Users/athekunal/DEV/Agent-Shaper/agent_shaper/transformer/llama_einsum.py')
+_CLASS_NAME = 'Transformer'
 
 
 def _load_rewritten_class():
-    spec = importlib.util.spec_from_file_location("_rewritten_gpt", _REWRITTEN_SRC)
+    spec = importlib.util.spec_from_file_location("_rewritten_transformer", _REWRITTEN_SRC)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return getattr(mod, _CLASS_NAME)
@@ -30,7 +30,7 @@ def _outputs_close(a, b, atol: float = 1e-5) -> bool:
     return True
 
 
-def test_gpt_rewrite_matches_original():
+def test_transformer_rewrite_matches_original():
     original_module = torch.load(_FIXTURE_DIR / "module.pt", weights_only=False)
     input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
     expected_output = torch.load(_FIXTURE_DIR / "output.pt", weights_only=False)

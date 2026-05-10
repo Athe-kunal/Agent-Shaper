@@ -1,4 +1,4 @@
-"""Auto-generated: validates LLM rewrite of CausalSelfAttention."""
+"""Auto-generated: validates rewrite of CausalSelfAttention."""
 from __future__ import annotations
 
 import importlib.util
@@ -7,18 +7,12 @@ from pathlib import Path
 import torch
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / 'CausalSelfAttention'
-_REWRITTEN_SRC = (
-    Path(__file__).parent.parent.parent
-    / 'llm_annotated_output_einsum'
-    / 'agent_shaper/transformer/model.py'
-)
+_REWRITTEN_SRC = Path('/Users/athekunal/DEV/Agent-Shaper/agent_shaper/transformer/model_einsum.py')
 _CLASS_NAME = 'CausalSelfAttention'
 
 
 def _load_rewritten_class():
-    spec = importlib.util.spec_from_file_location(
-        "_rewritten_causalselfattention", _REWRITTEN_SRC
-    )
+    spec = importlib.util.spec_from_file_location("_rewritten_causalselfattention", _REWRITTEN_SRC)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return getattr(mod, _CLASS_NAME)
@@ -37,13 +31,9 @@ def _outputs_close(a, b, atol: float = 1e-5) -> bool:
 
 
 def test_causalselfattention_rewrite_matches_original():
-    original_module = torch.load(
-        _FIXTURE_DIR / "module.pt", weights_only=False
-    )
+    original_module = torch.load(_FIXTURE_DIR / "module.pt", weights_only=False)
     input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
-    expected_output = torch.load(
-        _FIXTURE_DIR / "output.pt", weights_only=False
-    )
+    expected_output = torch.load(_FIXTURE_DIR / "output.pt", weights_only=False)
 
     rewritten_cls = _load_rewritten_class()
     original_module.__class__ = rewritten_cls
@@ -53,6 +43,6 @@ def test_causalselfattention_rewrite_matches_original():
         actual_output = original_module(*input_args)
 
     assert _outputs_close(actual_output, expected_output), (
-        f"LLM rewrite of {_CLASS_NAME} produces different outputs. "
+        f"Rewrite of {_CLASS_NAME} produces different outputs. "
         "Check the rewritten forward() for correctness."
     )
