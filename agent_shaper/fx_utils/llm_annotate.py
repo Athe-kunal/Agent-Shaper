@@ -394,10 +394,10 @@ async def llm_annotate_module_source(
         base_url=os.environ.get("OPENAI_BASE_URL"),
     )
 
-    module_infos = get_module_shapes(
+    shape_result = get_module_shapes(
         module, example_args, workspace=workspace, dim_names=dim_names
     )
-    line_map = _build_line_map(module_infos)
+    line_map = _build_line_map(shape_result.modules)
 
     file_to_annotations: dict[str, dict[int, list]] = defaultdict(dict)
     for (src_file, lineno), tensors in line_map.items():
@@ -417,7 +417,7 @@ async def llm_annotate_module_source(
 
     seen_keys: set[tuple[str, int]] = set()
     specs: list[_TaskSpec] = []
-    for info in module_infos:
+    for info in shape_result.modules:
         src_file = info.source_file
         if src_file is None or info.line_start is None or info.line_end is None:
             continue
@@ -434,7 +434,7 @@ async def llm_annotate_module_source(
             _TaskSpec(src_file, info.line_start, info.line_end, info.class_name, class_src)
         )
 
-    capture_map = _run_capture_indexed(module, example_args, module_infos)
+    capture_map = _run_capture_indexed(module, example_args, shape_result.modules)
     tasks: list[asyncio.Task] = []
     pbar = tqdm(total=len(specs) * max_turns, desc="Rewriting modules")
 

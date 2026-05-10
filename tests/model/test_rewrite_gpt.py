@@ -9,7 +9,7 @@ import torch
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / 'GPT'
 _REWRITTEN_SRC = (
     Path(__file__).parent.parent.parent
-    / 'llm_annotated_output_jax'
+    / 'llm_annotated_output_einsum'
     / 'agent_shaper/transformer/model.py'
 )
 _CLASS_NAME = 'GPT'
