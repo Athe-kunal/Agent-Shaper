@@ -405,14 +405,19 @@ async def llm_annotate_module_source(
 
     file_source_lines: dict[str, list[str]] = {}
     file_annotated_lines: dict[str, list[str]] = {}
-    for src_file in file_to_annotations:
+    func_src_files = {
+        info.source_file
+        for info in shape_result.functions
+        if info.source_file is not None and info.tensors
+    }
+    for src_file in set(file_to_annotations) | func_src_files:
         try:
             src_lines = _read_source_lines(src_file)
         except OSError:
             continue
         file_source_lines[src_file] = src_lines
         file_annotated_lines[src_file] = _build_annotated_lines(
-            src_lines, file_to_annotations[src_file]
+            src_lines, file_to_annotations.get(src_file, {})
         )
 
     seen_keys: set[tuple[str, int]] = set()
@@ -432,6 +437,25 @@ async def llm_annotate_module_source(
         )
         specs.append(
             _TaskSpec(src_file, info.line_start, info.line_end, info.class_name, class_src)
+        )
+
+    for info in shape_result.functions:
+        if not info.tensors:
+            continue
+        src_file = info.source_file
+        if src_file is None or info.line_start is None or info.line_end is None:
+            continue
+        if src_file not in file_annotated_lines:
+            continue
+        func_key = (src_file, info.line_start)
+        if func_key in seen_keys:
+            continue
+        seen_keys.add(func_key)
+        func_src = _extract_class_src(
+            file_annotated_lines[src_file], info.line_start, info.line_end
+        )
+        specs.append(
+            _TaskSpec(src_file, info.line_start, info.line_end, info.func_name, func_src)
         )
 
     capture_map = _run_capture_indexed(module, example_args, shape_result.modules)
