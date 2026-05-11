@@ -188,6 +188,27 @@ def _build_dep_order(modules: list) -> list[str]:
     return order
 
 
+def _workspace_module_classes(abs_src_file: str) -> list[str]:
+    """Return names of nn.Module subclasses defined in the file (via AST)."""
+    try:
+        with open(abs_src_file) as fh:
+            tree = ast.parse(fh.read())
+    except (OSError, SyntaxError):
+        return []
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                try:
+                    base_str = ast.unparse(base)
+                except AttributeError:
+                    base_str = ""
+                if "Module" in base_str:
+                    names.append(node.name)
+                    break
+    return names
+
+
 def _ensure_einops_imports(file_src: str, class_src: str) -> str:
     """Inject missing einops imports into file_src based on names used in class_src."""
     needs_rearrange = "rearrange" in class_src and "from einops import rearrange" not in file_src
@@ -389,6 +410,25 @@ def get_annotated_sources(
 
     dep_lines = "\n".join(f"  {i+1}. {cls}" for i, cls in enumerate(dep_order))
     header = f"Rewrite order (leaves → composites — rewrite top-to-bottom):\n{dep_lines}"
+
+    # Warn about workspace nn.Module classes in the requested files that could not
+    # be traced by either torch.export or the symbolic_trace fallback.
+    all_traced = {m.class_name for m in shape_result.modules}
+    missed: list[str] = []
+    for abs_f in requested:
+        for cls_name in _workspace_module_classes(abs_f):
+            if cls_name not in all_traced and cls_name not in missed:
+                missed.append(cls_name)
+
+    if missed:
+        missed_lines = "\n".join(f"  - {c}" for c in missed)
+        warning = (
+            "WARNING: The following classes could not be traced by torch.export "
+            "or symbolic_trace — no shape annotations available. Rewrite them "
+            "manually using context from their callers above:\n" + missed_lines
+        )
+        header = warning + "\n\n" + header
+
     return header + "\n\n" + "\n".join(sections)
 
 
@@ -479,7 +519,7 @@ def validate_rewrite(
         test_mod.__class__ = rewritten_cls
         test_mod.eval()
         with torch.no_grad():
-            actual = test_mod(*capture_entry.input_args)
+            actual = test_mod(*capture_entry.input_args, **capture_entry.input_kwargs)
     except Exception:
         return f"FAIL: Forward pass raised:\n{traceback.format_exc()}"
 
@@ -557,7 +597,7 @@ def validate_file_rewrite(
             test_mod.__class__ = rewritten_cls
             test_mod.eval()
             with torch.no_grad():
-                actual = test_mod(*entry.input_args)
+                actual = test_mod(*entry.input_args, **entry.input_kwargs)
             if _close(actual, entry.output):
                 rows.append(f"  {class_name:<28} PASS")
             else:
@@ -671,6 +711,7 @@ def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
         def test_{lower}_rewrite_matches_original():
             original_module = torch.load(_FIXTURE_DIR / "module.pt", weights_only=False)
             input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
+            input_kwargs = torch.load(_FIXTURE_DIR / "input_kwargs.pt", weights_only=False)
             expected_output = torch.load(_FIXTURE_DIR / "output.pt", weights_only=False)
 
             rewritten_cls = _load_rewritten_class()
@@ -678,7 +719,7 @@ def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
 
             original_module.eval()
             with torch.no_grad():
-                actual_output = original_module(*input_args)
+                actual_output = original_module(*input_args, **input_kwargs)
 
             assert _outputs_close(actual_output, expected_output), (
                 f"Rewrite of {{_CLASS_NAME}} produces different outputs. "

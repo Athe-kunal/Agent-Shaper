@@ -24,6 +24,7 @@ class _CaptureEntry(NamedTuple):
     origin: str
     sub_module: nn.Module
     input_args: tuple
+    input_kwargs: dict
     output: Any
 
 
@@ -41,9 +42,9 @@ class _ForwardHook:
         self._class_name = class_name
         self._captures = captures
 
-    def __call__(self, _module: nn.Module, args: tuple, output: Any) -> None:
+    def __call__(self, _module: nn.Module, args: tuple, kwargs: dict, output: Any) -> None:
         if self._class_name not in self._captures:
-            self._captures[self._class_name] = (args, output)
+            self._captures[self._class_name] = (args, kwargs, output)
 
 
 def _detach(obj: Any) -> Any:
@@ -69,7 +70,7 @@ def _run_capture(
     handles: list = []
 
     for info in module_infos:
-        if info.class_name in raw_captures:
+        if info.class_name in origin_by_class:
             continue
         raw_origin = "" if info.module_origin == "root" else info.module_origin
         sub_mod = path_to_module.get(raw_origin)
@@ -77,7 +78,7 @@ def _run_capture(
             continue
         origin_by_class[info.class_name] = raw_origin
         hook = _ForwardHook(info.class_name, raw_captures)
-        handles.append(sub_mod.register_forward_hook(hook))
+        handles.append(sub_mod.register_forward_hook(hook, with_kwargs=True))
 
     with torch.no_grad():
         module.eval()
@@ -87,7 +88,7 @@ def _run_capture(
         handle.remove()
 
     entries = []
-    for class_name, (input_args, output) in raw_captures.items():
+    for class_name, (input_args, input_kwargs, output) in raw_captures.items():
         raw_origin = origin_by_class[class_name]
         sub_mod = path_to_module.get(raw_origin, module)
         entries.append(_CaptureEntry(
@@ -95,6 +96,7 @@ def _run_capture(
             origin=raw_origin,
             sub_module=sub_mod,
             input_args=_detach(input_args),
+            input_kwargs={k: _detach(v) for k, v in input_kwargs.items()},
             output=_detach(output),
         ))
 
@@ -124,6 +126,7 @@ def _save_fixtures(entry: _CaptureEntry, tests_dir: str, src_file: str) -> None:
     fdir.mkdir(parents=True, exist_ok=True)
     torch.save(entry.sub_module, fdir / "module.pt")
     torch.save(entry.input_args, fdir / "input.pt")
+    torch.save(entry.input_kwargs, fdir / "input_kwargs.pt")
     torch.save(entry.output, fdir / "output.pt")
 
 
@@ -177,6 +180,7 @@ def _generate_test_content(
                 _FIXTURE_DIR / "module.pt", weights_only=False
             )
             input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
+            input_kwargs = torch.load(_FIXTURE_DIR / "input_kwargs.pt", weights_only=False)
             expected_output = torch.load(
                 _FIXTURE_DIR / "output.pt", weights_only=False
             )
@@ -186,7 +190,7 @@ def _generate_test_content(
 
             original_module.eval()
             with torch.no_grad():
-                actual_output = original_module(*input_args)
+                actual_output = original_module(*input_args, **input_kwargs)
 
             assert _outputs_close(actual_output, expected_output), (
                 f"LLM rewrite of {{_CLASS_NAME}} produces different outputs. "

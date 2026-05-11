@@ -12,6 +12,7 @@ import ast
 import inspect
 import os
 import re
+import sys
 from collections import defaultdict
 from typing import NamedTuple, Optional, Tuple
 
@@ -63,8 +64,32 @@ def _is_workspace_cls(cls: type, workspace: str) -> bool:
         return False
 
 
+def _nearest_workspace_ancestor(qual_path: str, path_to_module: dict, workspace: str):
+    """Walk up qual_path to find the nearest ancestor that IS a workspace class.
+
+    Used when a leaf entry in nn_module_stack is a non-workspace module (e.g.
+    nn.Linear) whose workspace parent was omitted because it was called via
+    .forward() rather than __call__, bypassing torch.export's stack tracking.
+    """
+    parts = qual_path.split(".")
+    for n in range(len(parts) - 1, 0, -1):
+        parent_path = ".".join(parts[:n])
+        parent_mod = path_to_module.get(parent_path)
+        if parent_mod is not None and _is_workspace_cls(type(parent_mod), workspace):
+            return parent_path, type(parent_mod)
+    return None, None
+
+
 def _innermost_workspace_origin(node, workspace, path_to_module):
-    """Return (qualified_path, cls) for the innermost workspace module owning this node."""
+    """Return (qualified_path, cls, via_ancestor) for the workspace module owning this node.
+
+    via_ancestor=True means the match was found by walking up from a non-workspace
+    child (e.g. nn.Linear inside SelfAttention called via .forward()), not from a
+    direct nn_module_stack entry for that class. Callers use this flag to decide
+    whether to supplement with a symbolic-trace pass.
+
+    Returns (None, None, False) when no workspace class can be attributed.
+    """
     stack = node.meta.get("nn_module_stack") or {}
     for key, val in reversed(list(stack.items())):
         if not (isinstance(val, tuple) and len(val) == 2):
@@ -75,10 +100,17 @@ def _innermost_workspace_origin(node, workspace, path_to_module):
             if mod is not None:
                 cls = type(mod)
                 if _is_workspace_cls(cls, workspace):
-                    return qual_path, cls
+                    return qual_path, cls, False
+                # Not workspace; its workspace parent may have been skipped
+                # because it was called via .forward() instead of __call__.
+                ancestor_path, ancestor_cls = _nearest_workspace_ancestor(
+                    qual_path, path_to_module, workspace
+                )
+                if ancestor_path is not None:
+                    return ancestor_path, ancestor_cls, True
         elif isinstance(cls_or_str, type) and _is_workspace_cls(cls_or_str, workspace):
-            return qual_path, cls_or_str
-    return None, None
+            return qual_path, cls_or_str, False
+    return None, None, False
 
 
 def _node_callsite(node, workspace: str):
@@ -247,6 +279,107 @@ def _hashable_shape(shape):
     return shape
 
 
+# ─── Symbolic-trace fallback ──────────────────────────────────────────────────
+
+def _wrap_file_fns(sub_mod: nn.Module) -> None:
+    """Register all standalone functions from sub_mod's source file as FX leaf nodes.
+
+    This prevents symbolic_trace from trying to trace into functions like
+    apply_rotary_embeddings that iterate over Proxy objects (causing errors).
+    """
+    try:
+        src_file = os.path.abspath(inspect.getfile(type(sub_mod)))
+    except (OSError, TypeError):
+        return
+    for mod in sys.modules.values():
+        try:
+            mod_file = getattr(mod, "__file__", None)
+            if not mod_file or os.path.abspath(mod_file) != src_file:
+                continue
+            for name in list(vars(mod)):
+                obj = getattr(mod, name, None)
+                if callable(obj) and not isinstance(obj, (type, nn.Module)):
+                    try:
+                        torch.fx.wrap(obj)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+
+def _symbolic_trace_fallback(
+    sub_mod: nn.Module,
+    input_args: tuple,
+    workspace: str,
+    val_to_names: dict,
+    get_cls_meta,
+) -> list[TensorInfo]:
+    """Attempt torch.fx.symbolic_trace for a module torch.export couldn't handle.
+
+    Splits input_args into tensor args (traced symbolically) and non-tensor args
+    (frozen as concrete_args so the tracer can handle integer slice indices, etc.).
+    Returns a list of TensorInfo, or [] if tracing or shape propagation fail.
+    """
+    cls = type(sub_mod)
+
+    try:
+        sig = inspect.signature(sub_mod.forward)
+        param_names = list(sig.parameters.keys())
+    except (ValueError, TypeError):
+        return []
+
+    concrete_args: dict = {}
+    tensor_args: list = []
+    for name, arg in zip(param_names, input_args):
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+        else:
+            concrete_args[name] = arg
+
+    traced = None
+    for attempt in range(2):
+        try:
+            traced = torch.fx.symbolic_trace(
+                sub_mod,
+                concrete_args=concrete_args if concrete_args else None,
+            )
+            break
+        except Exception as exc:
+            if attempt == 0 and "cannot be iterated" in str(exc):
+                _wrap_file_fns(sub_mod)
+                continue
+            return []
+    if traced is None:
+        return []
+
+    try:
+        ShapeProp(traced).propagate(*tensor_args)
+    except Exception:
+        return []
+
+    _, _, _, src_file, abs_file, varnames = get_cls_meta(cls)
+
+    tensors: list[TensorInfo] = []
+    for node in traced.graph.nodes:
+        if node.op not in ("call_function", "call_method", "call_module"):
+            continue
+        shape, dtype = _node_shape(node)
+        if shape is None:
+            continue
+        line_no = _node_line(node, abs_file)
+        var = varnames.get(line_no) if line_no is not None else None
+        tensor_name = f"{var} [{_node_op_name(node)}]" if var is not None else node.name
+        tensors.append(TensorInfo(
+            name=tensor_name,
+            shape=shape,
+            annotated_shape=_annotate(shape, val_to_names),
+            dtype=dtype,
+            source_file=src_file,
+            line_number=line_no,
+        ))
+    return tensors
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def get_module_shapes(
@@ -303,11 +436,17 @@ def get_module_shapes(
     # ── Pass 1: group FX nodes by workspace nn.Module ──────────────────────────
     mod_seen_keys: list[tuple] = []
     mod_key_to_tensors: dict[tuple, list[TensorInfo]] = {}
+    # Classes whose ops were attributed only via ancestor-walk (called via
+    # .forward()), meaning their annotation is incomplete — only child-module
+    # ops are captured, not their own intermediate tensor ops.
+    ancestor_only_classes: set[str] = set()
 
     for node in gm.graph.nodes:
-        origin, cls = _innermost_workspace_origin(node, workspace, path_to_module)
+        origin, cls, via_ancestor = _innermost_workspace_origin(node, workspace, path_to_module)
         if cls is None:
             continue
+        if via_ancestor:
+            ancestor_only_classes.add(cls.__name__)
         key = (origin, cls)
         shape, dtype = _node_shape(node)
         src_lines, start, end, src_file, abs_file, varnames = get_cls_meta(cls)
@@ -362,6 +501,97 @@ def get_module_shapes(
             parameters=params,
             tensors=tensors,
         ))
+
+    # ── Fallback pass: symbolic_trace for workspace classes missed by export ─────
+    # Two cases need the fallback:
+    #   1. Class not in modules at all — torch.export couldn't trace it.
+    #   2. Class in ancestor_only_classes — appeared only via child-module
+    #      parent-walk, so its own intermediate ops are missing.
+    traced_class_names: set[str] = {m.class_name for m in modules}
+    needs_fallback: set[str] = ancestor_only_classes | (
+        {
+            type(sub_mod).__name__
+            for sub_mod in path_to_module.values()
+            if _is_workspace_cls(type(sub_mod), workspace)
+        } - traced_class_names
+    )
+
+    # Pick one representative sub-module instance per class that needs fallback.
+    gap: dict[str, tuple[str, nn.Module]] = {}
+    for origin, sub_mod in path_to_module.items():
+        cls = type(sub_mod)
+        if (
+            _is_workspace_cls(cls, workspace)
+            and cls.__name__ in needs_fallback
+            and cls.__name__ not in gap
+        ):
+            gap[cls.__name__] = (origin, sub_mod)
+
+    if gap:
+        # Capture forward() inputs for each gap class by temporarily patching the
+        # class's forward method. This intercepts even direct .forward() calls
+        # (which bypass __call__ and therefore bypass register_forward_hook).
+        raw_captures: dict[str, tuple] = {}
+        patched_forwards: dict[type, callable] = {}
+
+        def _make_patched_forward(cls_name: str, target_instance: nn.Module, orig_fwd):
+            def _patched(self_inner, *args, **kwargs):
+                if cls_name not in raw_captures and self_inner is target_instance:
+                    raw_captures[cls_name] = args
+                return orig_fwd(self_inner, *args, **kwargs)
+            return _patched
+
+        for cls_name, (_origin, sub_mod) in gap.items():
+            cls = type(sub_mod)
+            if cls not in patched_forwards:
+                orig_fwd = cls.forward
+                patched_forwards[cls] = orig_fwd
+                cls.forward = _make_patched_forward(cls_name, sub_mod, orig_fwd)
+
+        try:
+            with torch.no_grad():
+                module(*example_args)
+        except Exception:
+            pass
+
+        for cls, orig_fwd in patched_forwards.items():
+            cls.forward = orig_fwd
+
+        for cls_name, (origin, sub_mod) in gap.items():
+            input_args = raw_captures.get(cls_name)
+            if input_args is None:
+                continue
+            tensors = _symbolic_trace_fallback(
+                sub_mod, input_args, workspace, val_to_names, get_cls_meta
+            )
+            if not tensors:
+                continue
+            cls = type(sub_mod)
+            src_lines, start, end, src_file, abs_file, varnames = get_cls_meta(cls)
+            params = [
+                TensorInfo(
+                    name=pname,
+                    shape=tuple(p.shape),
+                    annotated_shape=_annotate(tuple(p.shape), val_to_names),
+                    dtype=p.dtype,
+                    source_file=src_file,
+                    line_number=_param_line(src_lines, start, pname) if start is not None else None,
+                )
+                for pname, p in sub_mod.named_parameters(recurse=False)
+            ]
+            # Remove any partial ancestor-walk entry so the full symbolic-trace
+            # result is the single authoritative entry for this class.
+            modules[:] = [m for m in modules if m.class_name != cls_name]
+            modules.append(ModuleInfo(
+                class_name=cls_name,
+                module_origin=origin or "root",
+                source_file=src_file,
+                line_start=start,
+                line_end=end,
+                parameters=params,
+                tensors=tensors,
+            ))
+            traced_class_names.add(cls_name)
 
     # ── Pass 2: attribute FX nodes to workspace standalone functions ────────────
     # torch.export inlines standalone functions, so stack_trace only records the
