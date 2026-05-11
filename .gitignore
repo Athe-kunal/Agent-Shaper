@@ -220,3 +220,5 @@ __marimo__/
 .vscode
 
 llms-full.txt
+
+tests/

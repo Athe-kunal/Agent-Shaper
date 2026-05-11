@@ -25,19 +25,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def compute_logprobs(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """Per-sequence summed log-probabilities over masked positions (DPO-style)."""
-    logits = logits[:, :-1, :]
-    labels = labels[:, 1:]
-    mask = mask[:, 1:]
+    logits: torch.Tensor,  # b s v
+    labels: torch.Tensor,  # b s
+    mask: torch.Tensor,    # b s
+) -> torch.Tensor:         # b
+    """Per-sequence masked log-prob sum (DPO-style).
 
-    log_probs = F.log_softmax(logits, dim=-1)
-    per_token_logps = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-    per_token_logps = per_token_logps * mask
-    return per_token_logps.sum(dim=-1)
+    Shape narrative:
+      logits, labels, mask  :  b s v / b s / b s
+      after causal shift    :  b (s-1) v / b (s-1) / b (s-1)
+      log_probs             :  b (s-1) v   -- log-softmax over vocab
+      per_token_logps       :  b (s-1)     -- gather chosen-token logp
+      return                :  b           -- einsum "b s, b s -> b" masked sum
+    """
+    # causal shift: predict token t+1 from context up to t
+    logits = logits[:, :-1, :]  # b (s-1) v
+    labels = labels[:, 1:]      # b (s-1)
+    mask   = mask[:, 1:]        # b (s-1)
+
+    log_probs: torch.Tensor = F.log_softmax(logits, dim=-1)  # b (s-1) v
+
+    # gather the log-prob of each target token: b (s-1) v -> b (s-1)
+    per_token_logps: torch.Tensor = torch.gather(
+        log_probs, dim=-1, index=labels.unsqueeze(-1)
+    ).squeeze(-1)  # b (s-1)
+
+    # masked sum over sequence: equivalent to (per_token_logps * mask).sum(-1)
+    return einops.einsum(per_token_logps, mask, "b s, b s -> b")  # b
 
 
 class DPOLoss(nn.Module):

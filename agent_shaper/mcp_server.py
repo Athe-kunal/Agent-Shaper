@@ -25,10 +25,21 @@ if _REPO_ROOT not in sys.path:
 import torch.nn as nn
 from mcp.server.fastmcp import FastMCP
 
-from agent_shaper.fx_utils.get_fx_data import FunctionInfo, ModuleInfo, TensorInfo, get_module_shapes
+from agent_shaper.fx_utils.get_fx_data import (
+    FunctionInfo,
+    ModuleInfo,
+    TensorInfo,
+    _build_workspace_func_registry,
+    get_module_shapes,
+)
 from agent_shaper.fx_utils.llm_annotate import _TaskSpec, _validate_rewrite
 from agent_shaper.fx_utils.manual_annotate import _annotate_source_lines, _build_line_map
-from agent_shaper.fx_utils.test_generator import _run_capture_indexed, _save_fixtures
+from agent_shaper.fx_utils.test_generator import (
+    _capture_function_calls,
+    _run_capture_indexed,
+    _save_fixtures,
+    _save_function_fixtures,
+)
 
 mcp = FastMCP("agent-shaper-fx")
 
@@ -99,6 +110,37 @@ def _exec_script(script: str) -> dict:
         sys.path.insert(0, _WORKSPACE)
     exec(textwrap.dedent(script), ns)  # noqa: S102
     return ns
+
+
+def _resolve_func_infos(
+    func_names: list[str],
+    traced_functions: list,
+) -> tuple[list, list[str]]:
+    """Return (func_info_list, still_missing) for requested func_names.
+
+    First tries the traced graph; falls back to a workspace file-system scan so
+    that functions called from non-workspace wrappers are still found.
+    """
+    traced_map = {f.func_name: f for f in traced_functions}
+    registry = _build_workspace_func_registry(_WORKSPACE)
+
+    infos: list[FunctionInfo] = []
+    missing: list[str] = []
+    for name in func_names:
+        if name in traced_map:
+            infos.append(traced_map[name])
+        elif name in registry:
+            abs_file, rel_file, line_start, line_end = registry[name][0]
+            infos.append(FunctionInfo(
+                func_name=name,
+                source_file=rel_file,
+                line_start=line_start,
+                line_end=line_end,
+                tensors=[],
+            ))
+        else:
+            missing.append(name)
+    return infos, missing
 
 
 def _find_module(ns: dict) -> Optional[nn.Module]:
@@ -620,16 +662,20 @@ def validate_file_rewrite(
 def save_fixtures(
     script: str,
     class_names: list[str],
+    func_names: list[str] = [],
     tests_dir: str = "tests",
 ) -> str:
-    """Capture and save forward() fixtures for specified nn.Module classes.
+    """Capture and save forward() fixtures for nn.Module classes and standalone functions.
 
-    Runs the model, hooks into each class's forward(), and saves three files per class:
+    For each class, hooks into forward() and saves:
       {tests_dir}/{src_stem}/fixtures/{ClassName}/module.pt  — serialised sub-module
       {tests_dir}/{src_stem}/fixtures/{ClassName}/input.pt   — captured forward() inputs
       {tests_dir}/{src_stem}/fixtures/{ClassName}/output.pt  — captured forward() outputs
 
-    These fixtures are consumed by tests generated with generate_test_files.
+    For each function, monkey-patches it during the forward pass and saves:
+      {tests_dir}/{src_stem}/fixtures/{func_name}/input.pt   — captured call inputs
+      {tests_dir}/{src_stem}/fixtures/{func_name}/output.pt  — captured call output
+      (no module.pt — functions have no state)
 
     The script must assign:
       - `model`       : an nn.Module instance to trace
@@ -638,43 +684,63 @@ def save_fixtures(
     Args:
         script: Python source that sets up model and example_args.
         class_names: List of nn.Module class names to capture fixtures for.
+        func_names: List of standalone function names to capture fixtures for.
         tests_dir: Root test directory (default "tests").
 
     Returns:
-        List of fixture paths written, and any class names that could not be captured.
+        List of fixture paths written, and any names that could not be captured.
     """
     error, model, example_args, shape_result = _run_fx(script)
     if error:
         return error
 
-    capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
-    class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
-
     saved: list[str] = []
     missing: list[str] = []
-    for class_name in class_names:
-        entry = capture_map.get(class_name)
-        src_file = class_to_src.get(class_name)
-        if entry is None or src_file is None:
-            missing.append(class_name)
-            continue
-        _save_fixtures(entry, tests_dir, src_file)
-        stem = Path(src_file).stem
-        saved.append(f"  {class_name:<28} → {tests_dir}/{stem}/fixtures/{class_name}/")
+
+    # --- nn.Module classes ---
+    if class_names:
+        capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
+        class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
+        for class_name in class_names:
+            entry = capture_map.get(class_name)
+            src_file = class_to_src.get(class_name)
+            if entry is None or src_file is None:
+                missing.append(class_name)
+                continue
+            _save_fixtures(entry, tests_dir, src_file)
+            stem = Path(src_file).stem
+            saved.append(f"  {class_name:<28} → {tests_dir}/{stem}/fixtures/{class_name}/")
+
+    # --- standalone functions ---
+    if func_names:
+        func_infos, unresolved = _resolve_func_infos(func_names, shape_result.functions)
+        missing.extend(unresolved)
+
+        fn_capture_map = _capture_function_calls(model, example_args, func_infos)
+        for func_name in func_names:
+            entry = fn_capture_map.get(func_name)
+            if entry is None:
+                if func_name not in missing:
+                    missing.append(func_name)
+                continue
+            _save_function_fixtures(entry, tests_dir)
+            stem = Path(entry.source_file).stem
+            saved.append(f"  {func_name:<28} → {tests_dir}/{stem}/fixtures/{func_name}/")
 
     lines: list[str] = []
     if saved:
         lines.append("Saved fixtures:")
         lines.extend(saved)
     if missing:
-        lines.append("Not found in traced graph (skipped):")
+        lines.append("Not found (skipped):")
         lines.extend(f"  {n}" for n in missing)
-    return "\n".join(lines) if lines else "No classes processed."
+    return "\n".join(lines) if lines else "No names processed."
 
 
 def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
     """Generate pytest file content that validates class_name against saved fixtures."""
     lower = class_name.lower()
+    rel_src = os.path.relpath(rewritten_abs_path, _WORKSPACE)
     return textwrap.dedent(f"""\
         \"\"\"Auto-generated: validates rewrite of {class_name}.\"\"\"
         from __future__ import annotations
@@ -685,7 +751,7 @@ def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
         import torch
 
         _FIXTURE_DIR = Path(__file__).parent / "fixtures" / {repr(class_name)}
-        _REWRITTEN_SRC = Path({repr(rewritten_abs_path)})
+        _REWRITTEN_SRC = Path(__file__).parents[2] / {repr(rel_src)}
         _CLASS_NAME = {repr(class_name)}
 
 
@@ -728,21 +794,79 @@ def _mcp_test_content(class_name: str, rewritten_abs_path: str) -> str:
     """)
 
 
+def _mcp_function_test_content(func_name: str, rewritten_abs_path: str) -> str:
+    """Generate pytest file content that validates a rewritten standalone function."""
+    lower = func_name.lower()
+    rel_src = os.path.relpath(rewritten_abs_path, _WORKSPACE)
+    return textwrap.dedent(f"""\
+        \"\"\"Auto-generated: validates rewrite of {func_name}.\"\"\"
+        from __future__ import annotations
+
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        import torch
+
+        _FIXTURE_DIR = Path(__file__).parent / "fixtures" / {repr(func_name)}
+        _REWRITTEN_SRC = Path(__file__).parents[2] / {repr(rel_src)}
+        _FUNC_NAME = {repr(func_name)}
+
+
+        def _load_rewritten_fn():
+            spec = importlib.util.spec_from_file_location("_rewritten_{lower}", _REWRITTEN_SRC)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+            return getattr(mod, _FUNC_NAME)
+
+
+        def _outputs_close(a, b, atol: float = 1e-5) -> bool:
+            if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+                return torch.allclose(a.float(), b.float(), atol=atol)
+            if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+                return all(
+                    _outputs_close(x, y, atol)
+                    for x, y in zip(a, b)
+                    if x is not None and y is not None
+                )
+            return True
+
+
+        def test_{lower}_rewrite_matches_original():
+            input_args = torch.load(_FIXTURE_DIR / "input.pt", weights_only=False)
+            input_kwargs = torch.load(_FIXTURE_DIR / "input_kwargs.pt", weights_only=False)
+            expected_output = torch.load(_FIXTURE_DIR / "output.pt", weights_only=False)
+
+            rewritten_fn = _load_rewritten_fn()
+            actual_output = rewritten_fn(*input_args, **input_kwargs)
+
+            assert _outputs_close(actual_output, expected_output), (
+                f"Rewrite of {{_FUNC_NAME}} produces different outputs. "
+                "Check the rewritten function for correctness."
+            )
+    """)
+
+
 @mcp.tool()
 def generate_test_files(
     script: str,
     class_names: list[str],
     rewritten_src_file: str,
+    func_names: list[str] = [],
     tests_dir: str = "tests",
 ) -> str:
-    """Generate pytest test files that validate rewritten classes against saved fixtures.
+    """Generate pytest test files that validate rewritten classes and functions against saved fixtures.
 
-    For each class_name, writes a test file at:
+    For each class_name, writes:
       {tests_dir}/{orig_src_stem}/test_rewrite_{classname}.py
+      (loads the rewritten class, swaps it into the fixture module, asserts output identity)
 
-    The test loads the class from rewritten_src_file (resolved to an absolute path),
-    swaps it into the fixture module, and asserts output identity. Run save_fixtures
-    first to create the fixture files the tests depend on.
+    For each func_name, writes:
+      {tests_dir}/{orig_src_stem}/test_rewrite_{func_name}.py
+      (imports the rewritten function directly, calls it with fixture inputs, asserts output identity)
+
+    Run save_fixtures first to create the fixture files the tests depend on.
 
     The script must assign:
       - `model`       : an nn.Module instance to trace
@@ -752,10 +876,11 @@ def generate_test_files(
         script: Python source that sets up model and example_args.
         class_names: List of nn.Module class names to generate tests for.
         rewritten_src_file: Relative or absolute path to the rewritten source file.
+        func_names: List of standalone function names to generate tests for.
         tests_dir: Root test directory (default "tests").
 
     Returns:
-        List of test file paths written, and any class names not found in the traced graph.
+        List of test file paths written, and any names not found in the traced graph.
     """
     error, model, example_args, shape_result = _run_fx(script)
     if error:
@@ -765,10 +890,11 @@ def generate_test_files(
     if not os.path.exists(rewritten_abs):
         return f"Rewritten source file not found: {rewritten_abs}"
 
-    class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
-
     written: list[str] = []
     missing: list[str] = []
+
+    # --- nn.Module classes ---
+    class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
     for class_name in class_names:
         src_file = class_to_src.get(class_name)
         if src_file is None:
@@ -782,18 +908,35 @@ def generate_test_files(
         test_path.write_text(content)
         written.append(f"  {class_name:<28} → {test_path}")
 
+    # --- standalone functions ---
+    resolved_funcs, unresolved_funcs = _resolve_func_infos(func_names, shape_result.functions)
+    missing.extend(unresolved_funcs)
+    for fi in resolved_funcs:
+        func_name = fi.func_name
+        src_file = fi.source_file
+        if src_file is None:
+            missing.append(func_name)
+            continue
+        stem = Path(src_file).stem
+        test_dir = Path(tests_dir) / stem
+        test_dir.mkdir(parents=True, exist_ok=True)
+        content = _mcp_function_test_content(func_name, rewritten_abs)
+        test_path = test_dir / f"test_rewrite_{func_name.lower()}.py"
+        test_path.write_text(content)
+        written.append(f"  {func_name:<28} → {test_path}")
+
     lines: list[str] = []
     if written:
         lines.append("Generated test files:")
         lines.extend(written)
         lines.append(
-            f"\nExpected fixture layout:  {tests_dir}/{{src_stem}}/fixtures/{{ClassName}}/[module|input|output].pt"
+            f"\nExpected fixture layout:  {tests_dir}/{{src_stem}}/fixtures/{{name}}/[input|output].pt"
         )
         lines.append("Run save_fixtures first if fixtures do not exist yet.")
     if missing:
         lines.append("Not found in traced graph (skipped):")
         lines.extend(f"  {n}" for n in missing)
-    return "\n".join(lines) if lines else "No classes processed."
+    return "\n".join(lines) if lines else "No names processed."
 
 
 if __name__ == "__main__":

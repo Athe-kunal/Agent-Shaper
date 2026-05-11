@@ -1,28 +1,42 @@
 """
-test_generator.py — auto-generates pytest tests that validate LLM-rewritten nn.Module classes.
+test_generator.py — auto-generates pytest tests that validate LLM-rewritten nn.Module classes
+and standalone functions.
 
 For each workspace nn.Module that passes iterative validation, generates:
   tests/{parent_module}/fixtures/{ClassName}/module.pt   — serialized original sub-module
   tests/{parent_module}/fixtures/{ClassName}/input.pt    — captured forward() input tuple
   tests/{parent_module}/fixtures/{ClassName}/output.pt   — captured original forward() output
   tests/{parent_module}/test_rewrite_{classname}.py      — pytest file with relative paths
+
+For standalone functions, the same layout is used without module.pt.
 """
 from __future__ import annotations
 
+import os
+import sys
 import textwrap
+import types
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
 
-from agent_shaper.fx_utils.get_fx_data import ModuleInfo
+from agent_shaper.fx_utils.get_fx_data import FunctionInfo, ModuleInfo
 
 
 class _CaptureEntry(NamedTuple):
     class_name: str
     origin: str
     sub_module: nn.Module
+    input_args: tuple
+    input_kwargs: dict
+    output: Any
+
+
+class _FunctionCaptureEntry(NamedTuple):
+    func_name: str
+    source_file: str
     input_args: tuple
     input_kwargs: dict
     output: Any
@@ -110,6 +124,94 @@ def _run_capture_indexed(
 ) -> dict[str, _CaptureEntry]:
     """Return {class_name: _CaptureEntry} for all captured workspace classes."""
     return {e.class_name: e for e in _run_capture(module, example_args, module_infos)}
+
+
+def _find_module_for_file(abs_file: str) -> Optional[types.ModuleType]:
+    """Return the sys.modules entry whose __file__ matches abs_file."""
+    for mod in sys.modules.values():
+        try:
+            if mod.__file__ and os.path.abspath(mod.__file__) == abs_file:
+                return mod
+        except AttributeError:
+            continue
+    return None
+
+
+def _capture_function_calls(
+    model: nn.Module,
+    example_args: tuple,
+    func_infos: list[FunctionInfo],
+) -> dict[str, _FunctionCaptureEntry]:
+    """Run a forward pass, monkey-patching each function to capture its first call.
+
+    Functions are temporarily replaced on their defining module so that all
+    callers (including module forward methods) transparently use the wrapper.
+    The original is restored whether the forward pass succeeds or not.
+    """
+    captures: dict[str, _FunctionCaptureEntry] = {}
+    restores: list[tuple[types.ModuleType, str, Any]] = []
+
+    for info in func_infos:
+        if info.source_file is None:
+            continue
+        abs_file = os.path.abspath(info.source_file)
+        mod = _find_module_for_file(abs_file)
+        if mod is None or not hasattr(mod, info.func_name):
+            continue
+
+        original_fn = getattr(mod, info.func_name)
+        func_name = info.func_name
+        src_file = info.source_file
+
+        def _make_wrapper(fn: Any, name: str, sf: str):
+            def _wrapper(*args, **kwargs):
+                result = fn(*args, **kwargs)
+                if name not in captures:
+                    captures[name] = _FunctionCaptureEntry(
+                        func_name=name,
+                        source_file=sf,
+                        input_args=_detach(args),
+                        input_kwargs={k: _detach(v) for k, v in kwargs.items()},
+                        output=_detach(result),
+                    )
+                return result
+            return _wrapper
+
+        wrapper = _make_wrapper(original_fn, func_name, src_file)
+
+        # Patch in the defining module (covers import-by-attribute callers).
+        setattr(mod, func_name, wrapper)
+        restores.append((mod.__dict__, func_name, original_fn))
+
+        # Also patch in the model's forward __globals__ dict so that callers
+        # that used `from module import fn` (binding at import time) are covered.
+        fwd_globals: dict = getattr(model.forward, "__globals__", {})
+        if func_name in fwd_globals and fwd_globals[func_name] is original_fn:
+            fwd_globals[func_name] = wrapper
+            restores.append((fwd_globals, func_name, original_fn))
+
+    try:
+        with torch.no_grad():
+            model.eval()
+            model(*example_args)
+    finally:
+        for target_dict, name, original in restores:
+            target_dict[name] = original
+
+    return captures
+
+
+def _save_function_fixtures(entry: _FunctionCaptureEntry, tests_dir: str) -> None:
+    fdir = (
+        Path(tests_dir)
+        / Path(entry.source_file).stem
+        / "fixtures"
+        / entry.func_name
+    )
+    fdir.mkdir(parents=True, exist_ok=True)
+    torch.save(entry.input_args, fdir / "input.pt")
+    torch.save(entry.input_kwargs, fdir / "input_kwargs.pt")
+    torch.save(entry.output, fdir / "output.pt")
 
 
 def _parent_module_name(src_file: str) -> str:
