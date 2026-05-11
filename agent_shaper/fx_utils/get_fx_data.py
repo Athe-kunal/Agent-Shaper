@@ -113,16 +113,24 @@ def _innermost_workspace_origin(node, workspace, path_to_module):
     return None, None, False
 
 
-def _node_callsite(node, workspace: str):
-    """Return (abs_file, line_no) of the innermost workspace frame in stack_trace."""
+def _node_callsites(node, workspace: str) -> list[tuple[str, int]]:
+    """Return all (abs_file, line_no) workspace frames from stack_trace, innermost first.
+
+    torch.export inlines standalone functions, so for a call chain like
+    exec_script → outer_fn (opd.py) → inner_fn (opd.py) → primitive_op, the
+    stack trace carries multiple workspace frames. Returning all of them lets
+    Pass 2 walk outward until it finds a frame whose source line names a
+    registry function — handling callers that are not themselves workspace files.
+    """
     trace = node.meta.get("stack_trace", "")
     if not trace:
-        return None, None
+        return []
+    result = []
     for f, line in reversed(re.findall(r'File "([^"]+)", line (\d+)', trace)):
         abs_f = os.path.abspath(f)
         if abs_f.startswith(workspace) and "site-packages" not in abs_f:
-            return abs_f, int(line)
-    return None, None
+            result.append((abs_f, int(line)))
+    return result
 
 
 def _build_workspace_func_registry(workspace: str) -> dict[str, list[tuple]]:
@@ -602,34 +610,42 @@ def get_module_shapes(
     func_key_meta: dict[tuple, tuple] = {}  # (abs_file, func_name) -> (rel_file, line_start, line_end)
 
     for node in gm.graph.nodes:
-        call_abs_file, call_line_no = _node_callsite(node, workspace)
-        if call_abs_file is None:
-            continue
+        # Walk workspace frames from innermost outward; stop at the first frame
+        # whose source line names a registry function.  This handles both the
+        # standard case (workspace forward() calls a workspace function — innermost
+        # frame is the call site) and the exec-script wrapper case (non-workspace
+        # forward() calls workspace functions — innermost frames are inside function
+        # bodies; the relevant call-site frame is one or more levels up).
+        for call_abs_file, call_line_no in _node_callsites(node, workspace):
+            src_lines = get_src_lines(call_abs_file)
+            called_names = _free_func_names_at_line(src_lines, call_line_no)
 
-        src_lines = get_src_lines(call_abs_file)
-        called_names = _free_func_names_at_line(src_lines, call_line_no)
+            matched = False
+            for func_name in called_names:
+                if func_name not in func_registry:
+                    continue
+                matched = True
+                for abs_func_file, rel_func_file, line_start, line_end in func_registry[func_name]:
+                    key = (abs_func_file, func_name)
+                    if key not in func_key_meta:
+                        func_key_meta[key] = (rel_func_file, line_start, line_end)
 
-        for func_name in called_names:
-            if func_name not in func_registry:
-                continue
-            for abs_func_file, rel_func_file, line_start, line_end in func_registry[func_name]:
-                key = (abs_func_file, func_name)
-                if key not in func_key_meta:
-                    func_key_meta[key] = (rel_func_file, line_start, line_end)
+                    shape, dtype = _node_shape(node)
+                    t = TensorInfo(
+                        name=node.name,
+                        shape=shape,
+                        annotated_shape=_annotate(shape, val_to_names),
+                        dtype=dtype,
+                        source_file=rel_func_file,
+                        line_number=None,  # inlined — exact body line not available
+                    )
+                    if key not in func_key_to_tensors:
+                        func_seen_keys.append(key)
+                        func_key_to_tensors[key] = []
+                    func_key_to_tensors[key].append(t)
 
-                shape, dtype = _node_shape(node)
-                t = TensorInfo(
-                    name=node.name,
-                    shape=shape,
-                    annotated_shape=_annotate(shape, val_to_names),
-                    dtype=dtype,
-                    source_file=rel_func_file,
-                    line_number=None,  # inlined — exact body line not available
-                )
-                if key not in func_key_to_tensors:
-                    func_seen_keys.append(key)
-                    func_key_to_tensors[key] = []
-                func_key_to_tensors[key].append(t)
+            if matched:
+                break  # innermost registry match wins; don't attribute to outer callers
 
     functions: list[FunctionInfo] = []
     func_seen_dedup: set[tuple] = set()

@@ -126,13 +126,31 @@ def _run_capture_indexed(
     return {e.class_name: e for e in _run_capture(module, example_args, module_infos)}
 
 
+def _src_path(file_path: str) -> str:
+    """Normalise a module __file__ to its .py source path.
+
+    Python sometimes stores the .pyc path in __file__ (e.g. when the module
+    was loaded from __pycache__). Stripping the cache suffix lets us compare
+    against .py paths from the workspace registry.
+    """
+    p = os.path.abspath(file_path)
+    if p.endswith(".pyc"):
+        # __pycache__/foo.cpython-312.pyc  →  ../foo.py
+        p = re.sub(r"__pycache__[/\\].+\.pyc$", "", p).rstrip("/\\") + ".py"
+        # simple fallback: strip trailing c
+        if not os.path.exists(p):
+            p = os.path.abspath(file_path)[:-1]
+    return p
+
+
 def _find_module_for_file(abs_file: str) -> Optional[types.ModuleType]:
-    """Return the sys.modules entry whose __file__ matches abs_file."""
+    """Return the sys.modules entry whose source file matches abs_file."""
     for mod in sys.modules.values():
         try:
-            if mod.__file__ and os.path.abspath(mod.__file__) == abs_file:
+            mf = getattr(mod, "__file__", None)
+            if mf and _src_path(mf) == abs_file:
                 return mod
-        except AttributeError:
+        except Exception:
             continue
     return None
 
@@ -151,17 +169,33 @@ def _capture_function_calls(
     captures: dict[str, _FunctionCaptureEntry] = {}
     restores: list[tuple[types.ModuleType, str, Any]] = []
 
+    fwd_globals: dict = getattr(model.forward, "__globals__", {})
+
     for info in func_infos:
         if info.source_file is None:
             continue
-        abs_file = os.path.abspath(info.source_file)
-        mod = _find_module_for_file(abs_file)
-        if mod is None or not hasattr(mod, info.func_name):
-            continue
-
-        original_fn = getattr(mod, info.func_name)
         func_name = info.func_name
         src_file = info.source_file
+        abs_file = os.path.abspath(src_file)
+
+        # Locate original_fn — try the defining sys.modules entry first, then
+        # fall back to scanning module aliases in fwd_globals.  The fallback
+        # covers the common exec-script pattern `import mod as alias; alias.fn()`
+        # where _find_module_for_file may fail due to a __file__ path mismatch.
+        mod = _find_module_for_file(abs_file)
+        original_fn = None
+        if mod is not None and hasattr(mod, func_name):
+            original_fn = getattr(mod, func_name)
+        if original_fn is None:
+            for var_val in fwd_globals.values():
+                if isinstance(var_val, types.ModuleType) and hasattr(var_val, func_name):
+                    candidate = getattr(var_val, func_name)
+                    if callable(candidate):
+                        original_fn = candidate
+                        mod = var_val  # treat the alias as the patching target
+                        break
+        if original_fn is None:
+            continue
 
         def _make_wrapper(fn: Any, name: str, sf: str):
             def _wrapper(*args, **kwargs):
@@ -179,16 +213,24 @@ def _capture_function_calls(
 
         wrapper = _make_wrapper(original_fn, func_name, src_file)
 
-        # Patch in the defining module (covers import-by-attribute callers).
+        # Patch on the module so attribute-access callers (`mod.fn(...)`) hit the wrapper.
         setattr(mod, func_name, wrapper)
         restores.append((mod.__dict__, func_name, original_fn))
 
-        # Also patch in the model's forward __globals__ dict so that callers
-        # that used `from module import fn` (binding at import time) are covered.
-        fwd_globals: dict = getattr(model.forward, "__globals__", {})
+        # Also patch any direct name bindings (`from module import fn`).
         if func_name in fwd_globals and fwd_globals[func_name] is original_fn:
             fwd_globals[func_name] = wrapper
             restores.append((fwd_globals, func_name, original_fn))
+
+        # Patch remaining module aliases in fwd_globals that still expose original_fn.
+        for var_val in list(fwd_globals.values()):
+            if (
+                isinstance(var_val, types.ModuleType)
+                and var_val is not mod
+                and getattr(var_val, func_name, None) is original_fn
+            ):
+                setattr(var_val, func_name, wrapper)
+                restores.append((var_val.__dict__, func_name, original_fn))
 
     try:
         with torch.no_grad():

@@ -389,6 +389,27 @@ def get_annotated_sources(
         if f.source_file and os.path.abspath(f.source_file) in requested
     ]
 
+    # For files with no traced coverage, fall back to the workspace function registry.
+    # This makes function-only files usable even when their functions aren't reached
+    # by the FX tracer's workspace-frame detection.
+    covered = (
+        {os.path.abspath(m.source_file) for m in modules if m.source_file}
+        | {os.path.abspath(f.source_file) for f in functions if f.source_file}
+    )
+    uncovered = requested - covered
+    if uncovered:
+        registry = _build_workspace_func_registry(_WORKSPACE)
+        for func_name, locations in registry.items():
+            for abs_file, rel_file, line_start, line_end in locations:
+                if abs_file in uncovered:
+                    functions.append(FunctionInfo(
+                        func_name=func_name,
+                        source_file=rel_file,
+                        line_start=line_start,
+                        line_end=line_end,
+                        tensors=[],
+                    ))
+
     if not modules and not functions:
         return "No workspace modules or functions found in the specified files."
 
@@ -534,17 +555,21 @@ def validate_rewrite(
     patched_src = _ensure_einops_imports("".join(patched_lines), rewritten_class_src)
 
     uid = uuid.uuid4().hex[:8]
+    mod_name = f"_tmp_cls_{uid}"
     temp_path = Path(tempfile.gettempdir()) / f"agent_shaper_cls_{uid}.py"
     try:
         temp_path.write_text(patched_src)
-        mod_spec = importlib.util.spec_from_file_location(f"_tmp_cls_{uid}", temp_path)
+        mod_spec = importlib.util.spec_from_file_location(mod_name, temp_path)
         tmp_mod = importlib.util.module_from_spec(mod_spec)
+        sys.modules[mod_spec.name] = tmp_mod
         mod_spec.loader.exec_module(tmp_mod)
-    except Exception as exc:
+    except Exception:
+        sys.modules.pop(mod_name, None)
         temp_path.unlink(missing_ok=True)
         return f"FAIL: Could not load patched file:\n{traceback.format_exc()}"
 
     rewritten_cls = getattr(tmp_mod, class_name, None)
+    sys.modules.pop(mod_name, None)
     temp_path.unlink(missing_ok=True)
     if rewritten_cls is None:
         return f"FAIL: Class '{class_name}' not found in patched module."
@@ -608,13 +633,16 @@ def validate_file_rewrite(
     # This avoids the problem of splicing a class that uses aliased einops names (esum,
     # rearrange) into the original file, which lacks those imports.
     uid = uuid.uuid4().hex[:8]
+    mod_name = f"_tmp_file_{uid}"
     temp_path = Path(tempfile.gettempdir()) / f"agent_shaper_file_{uid}.py"
     try:
         temp_path.write_text(rewritten_file_src)
-        mod_spec = importlib.util.spec_from_file_location(f"_tmp_file_{uid}", temp_path)
+        mod_spec = importlib.util.spec_from_file_location(mod_name, temp_path)
         tmp_mod = importlib.util.module_from_spec(mod_spec)
+        sys.modules[mod_spec.name] = tmp_mod
         mod_spec.loader.exec_module(tmp_mod)
     except Exception as exc:
+        sys.modules.pop(mod_name, None)
         temp_path.unlink(missing_ok=True)
         return f"Failed to load rewritten file: {exc}"
 
@@ -648,6 +676,7 @@ def validate_file_rewrite(
             first_line = traceback.format_exc().strip().splitlines()[-1]
             rows.append(f"  {class_name:<28} FAIL  {first_line}")
 
+    sys.modules.pop(mod_name, None)
     temp_path.unlink(missing_ok=True)
 
     if not rows:
@@ -659,10 +688,107 @@ def validate_file_rewrite(
 
 
 @mcp.tool()
+def validate_rewrite_function(
+    script: str,
+    func_name: str,
+    rewritten_func_src: str,
+) -> str:
+    """Validate an LLM-rewritten standalone function against the original call outputs.
+
+    Captures the original function call during the model's forward pass, then splices
+    the rewritten function into its source file and compares outputs with atol=1e-5.
+
+    The script must assign:
+      - `model`       : an nn.Module instance whose forward() calls the target function
+      - `example_args`: a tuple of example tensors matching the model's forward signature
+
+    Args:
+        script: Python source that sets up model and example_args.
+        func_name: Name of the standalone function that was rewritten (e.g. "compute_logprobs").
+        rewritten_func_src: Complete source of the rewritten function.
+
+    Returns:
+        "PASS: ..." on success, or "FAIL: ..." with a detailed error message.
+    """
+    error, model, example_args, shape_result = _run_fx(script)
+    if error:
+        return error
+
+    func_infos, not_found = _resolve_func_infos([func_name], shape_result.functions)
+    if not_found:
+        return f"Function '{func_name}' not found in workspace registry."
+
+    fi = func_infos[0]
+    if fi.source_file is None or fi.line_start is None or fi.line_end is None:
+        return f"Source location not available for function '{func_name}'."
+
+    fn_capture_map = _capture_function_calls(model, example_args, func_infos)
+    entry = fn_capture_map.get(func_name)
+    if entry is None:
+        return (
+            f"Could not capture call to '{func_name}' during forward pass. "
+            "Ensure the function is called while model(*example_args) runs."
+        )
+
+    try:
+        with open(fi.source_file) as fh:
+            file_source_lines = fh.readlines()
+    except OSError:
+        return f"Could not read source file: {fi.source_file}"
+
+    rewrite_lines = rewritten_func_src.splitlines(keepends=True)
+    if rewrite_lines and not rewrite_lines[-1].endswith("\n"):
+        rewrite_lines[-1] += "\n"
+    patched_lines = (
+        file_source_lines[: fi.line_start - 1]
+        + rewrite_lines
+        + file_source_lines[fi.line_end :]
+    )
+    patched_src = _ensure_einops_imports("".join(patched_lines), rewritten_func_src)
+
+    uid = uuid.uuid4().hex[:8]
+    mod_name = f"_tmp_fn_{uid}"
+    temp_path = Path(tempfile.gettempdir()) / f"agent_shaper_fn_{uid}.py"
+    try:
+        temp_path.write_text(patched_src)
+        mod_spec = importlib.util.spec_from_file_location(mod_name, temp_path)
+        tmp_mod = importlib.util.module_from_spec(mod_spec)
+        sys.modules[mod_spec.name] = tmp_mod
+        mod_spec.loader.exec_module(tmp_mod)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        temp_path.unlink(missing_ok=True)
+        return f"FAIL: Could not load patched file:\n{traceback.format_exc()}"
+
+    rewritten_fn = getattr(tmp_mod, func_name, None)
+    sys.modules.pop(mod_name, None)
+    temp_path.unlink(missing_ok=True)
+    if rewritten_fn is None:
+        return f"FAIL: Function '{func_name}' not found in patched module."
+
+    def _close(a, b, atol: float = 1e-5) -> bool:
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return torch.allclose(a.float(), b.float(), atol=atol)
+        if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+            return all(_close(x, y, atol) for x, y in zip(a, b) if x is not None and y is not None)
+        return True
+
+    try:
+        with torch.no_grad():
+            actual = rewritten_fn(*entry.input_args, **entry.input_kwargs)
+    except Exception:
+        return f"FAIL: Function call raised:\n{traceback.format_exc()}"
+
+    if _close(actual, entry.output):
+        return f"PASS: '{func_name}' rewrite produces identical outputs (atol=1e-5)."
+    return f"FAIL: '{func_name}' outputs differ beyond atol=1e-5."
+
+
+@mcp.tool()
 def save_fixtures(
     script: str,
     class_names: list[str],
-    func_names: list[str] = [],
+    func_names: Optional[list[str]] = None,
     tests_dir: str = "tests",
 ) -> str:
     """Capture and save forward() fixtures for nn.Module classes and standalone functions.
@@ -695,17 +821,20 @@ def save_fixtures(
         return error
 
     saved: list[str] = []
-    missing: list[str] = []
+    missing: list[tuple[str, str]] = []  # (name, reason)
 
     # --- nn.Module classes ---
     if class_names:
         capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
         class_to_src = {m.class_name: m.source_file for m in shape_result.modules if m.source_file}
         for class_name in class_names:
-            entry = capture_map.get(class_name)
             src_file = class_to_src.get(class_name)
-            if entry is None or src_file is None:
-                missing.append(class_name)
+            if src_file is None:
+                missing.append((class_name, "not found in traced graph"))
+                continue
+            entry = capture_map.get(class_name)
+            if entry is None:
+                missing.append((class_name, "trace succeeded but forward capture failed"))
                 continue
             _save_fixtures(entry, tests_dir, src_file)
             stem = Path(src_file).stem
@@ -714,14 +843,16 @@ def save_fixtures(
     # --- standalone functions ---
     if func_names:
         func_infos, unresolved = _resolve_func_infos(func_names, shape_result.functions)
-        missing.extend(unresolved)
+        missing.extend((n, "not in workspace registry") for n in unresolved)
+        already_missing = {n for n, _ in missing}
 
         fn_capture_map = _capture_function_calls(model, example_args, func_infos)
         for func_name in func_names:
+            if func_name in already_missing:
+                continue
             entry = fn_capture_map.get(func_name)
             if entry is None:
-                if func_name not in missing:
-                    missing.append(func_name)
+                missing.append((func_name, "in registry but not called during forward pass"))
                 continue
             _save_function_fixtures(entry, tests_dir)
             stem = Path(entry.source_file).stem
@@ -733,7 +864,7 @@ def save_fixtures(
         lines.extend(saved)
     if missing:
         lines.append("Not found (skipped):")
-        lines.extend(f"  {n}" for n in missing)
+        lines.extend(f"  {n:<28} ({reason})" for n, reason in missing)
     return "\n".join(lines) if lines else "No names processed."
 
 
@@ -853,7 +984,7 @@ def generate_test_files(
     script: str,
     class_names: list[str],
     rewritten_src_file: str,
-    func_names: list[str] = [],
+    func_names: Optional[list[str]] = None,
     tests_dir: str = "tests",
 ) -> str:
     """Generate pytest test files that validate rewritten classes and functions against saved fixtures.
@@ -909,7 +1040,7 @@ def generate_test_files(
         written.append(f"  {class_name:<28} → {test_path}")
 
     # --- standalone functions ---
-    resolved_funcs, unresolved_funcs = _resolve_func_infos(func_names, shape_result.functions)
+    resolved_funcs, unresolved_funcs = _resolve_func_infos(func_names or [], shape_result.functions)
     missing.extend(unresolved_funcs)
     for fi in resolved_funcs:
         func_name = fi.func_name
