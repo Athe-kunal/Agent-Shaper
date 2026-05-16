@@ -71,11 +71,11 @@ _SYSTEM_EINSUM = """\
 You are a PyTorch tensor-operation moderniser.
 
 You will receive a Python nn.Module class that has inline shape comments, for example:
-    y = a @ b.transpose(-2, -1)  # y: (4, 8, 8)
+    y = a @ b.transpose(-2, -1)  # y: (B, T, T)
 
-The numbers in the shapes are concrete dummy values from one example forward pass —
-they are NOT fixed constants. Always use descriptive dimension names that reflect what
-each dimension represents (e.g. batch_size, in_features, out_features, num_groups).
+The shapes use symbolic dimension names (e.g. B for batch, T for sequence length) for
+dynamic axes, and concrete integers for fixed axes (e.g. n_embd=64). Use these names
+directly in your einsum comments and einops patterns — do not replace them with numbers.
 
 You have two tools. Use each for what it is best at:
 
@@ -372,8 +372,8 @@ def _apply_replacements(
 async def llm_annotate_module_source(
     module: nn.Module,
     example_args: tuple,
+    dim_names: dict[str, int],
     workspace: Optional[str] = None,
-    dim_names: Optional[dict[str, int]] = None,
     output_dir: Optional[str] = None,
     show_diff: bool = False,
     open_in_vscode: bool = True,
@@ -546,5 +546,6 @@ if __name__ == "__main__":
             output_dir="llm_annotated_output_einsum",
             show_diff=True,
         )
+
 
     asyncio.run(main())
