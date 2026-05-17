@@ -35,6 +35,7 @@ from agent_shaper.fx_utils.get_fx_data import ModuleInfo, get_module_shapes
 from agent_shaper.fx_utils.manual_annotate import _annotate_source_lines, _build_line_map
 from agent_shaper.fx_utils.test_generator import (
     _CaptureEntry,
+    _DEFAULT_TESTS_DIR,
     _run_capture_indexed,
     _save_fixtures,
     _TestSpec,
@@ -71,11 +72,11 @@ _SYSTEM_EINSUM = """\
 You are a PyTorch tensor-operation moderniser.
 
 You will receive a Python nn.Module class that has inline shape comments, for example:
-    y = a @ b.transpose(-2, -1)  # y: (4, 8, 8)
+    y = a @ b.transpose(-2, -1)  # y: (B, T, T)
 
-The numbers in the shapes are concrete dummy values from one example forward pass —
-they are NOT fixed constants. Always use descriptive dimension names that reflect what
-each dimension represents (e.g. batch_size, in_features, out_features, num_groups).
+The shapes use symbolic dimension names (e.g. B for batch, T for sequence length) for
+dynamic axes, and concrete integers for fixed axes (e.g. n_embd=64). Use these names
+directly in your einsum comments and einops patterns — do not replace them with numbers.
 
 You have two tools. Use each for what it is best at:
 
@@ -372,12 +373,12 @@ def _apply_replacements(
 async def llm_annotate_module_source(
     module: nn.Module,
     example_args: tuple,
+    dim_names: dict[str, int],
     workspace: Optional[str] = None,
-    dim_names: Optional[dict[str, int]] = None,
     output_dir: Optional[str] = None,
     show_diff: bool = False,
     open_in_vscode: bool = True,
-    tests_dir: Optional[str] = "tests",
+    tests_dir: Optional[str] = None,
     max_turns: int = 3,
 ) -> dict[str, str]:
     """Rewrite workspace nn.Module classes using an LLM with iterative validation.
@@ -388,6 +389,8 @@ async def llm_annotate_module_source(
 
     Returns {relative_source_file: rewritten_source_code}.
     """
+    if tests_dir is None:
+        tests_dir = _DEFAULT_TESTS_DIR
     model = os.environ["OPENAI_MODEL"]
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
@@ -518,7 +521,10 @@ async def llm_annotate_module_source(
 
 if __name__ == "__main__":
     import torch
-    from agent_shaper.transformer.model import GPT, GPTConfig
+    from agent_shaper.transformer.model import GPT, GPTConfig, LayerNorm, CausalSelfAttention
+    from agent_shaper.fx_utils.get_fx_data import get_module_shapes
+    from agent_shaper.fx_utils.manual_annotate import _build_line_map, _annotate_source_lines
+    from collections import defaultdict
 
     cfg = GPTConfig(
         block_size=32,
@@ -535,16 +541,24 @@ if __name__ == "__main__":
         torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
         torch.randint(0, cfg.vocab_size, (B, T), dtype=torch.long),
     )
-
     dim_names = {"B": B, "T": T}
 
-    async def main():
-        await llm_annotate_module_source(
-            GPT(cfg),
-            example_args,
-            dim_names=dim_names,
-            output_dir="llm_annotated_output_einsum",
-            show_diff=True,
-        )
+    # ── Print what the LLM sees for MLP ──
+    result = get_module_shapes(GPT(cfg), example_args, dim_names=dim_names)
+    line_map = _build_line_map(result.modules)
 
-    asyncio.run(main())
+    file_annotations: dict = defaultdict(dict)
+    for (src_file, lineno), tensors in line_map.items():
+        file_annotations[src_file][lineno] = tensors
+
+    info = next(m for m in result.modules if m.class_name == "CausalSelfAttention")
+    with open(info.source_file) as f:
+        src_lines = f.readlines()
+
+    annotated = _annotate_source_lines(src_lines, file_annotations[info.source_file])
+    cls_src = "".join(annotated.splitlines(keepends=True)[info.line_start - 1: info.line_end])
+
+    print("=" * 60)
+    print(f"What the LLM sees for {info.class_name}:")
+    print("=" * 60)
+    print(cls_src)

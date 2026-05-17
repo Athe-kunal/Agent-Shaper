@@ -24,6 +24,8 @@ import torch.nn as nn
 
 from agent_shaper.fx_utils.get_fx_data import FunctionInfo, ModuleInfo
 
+_DEFAULT_TESTS_DIR: str = os.environ.get("AGENT_SHAPER_TESTS_DIR", "agent_shaper_tests")
+
 
 class _CaptureEntry(NamedTuple):
     class_name: str
@@ -343,7 +345,7 @@ def _generate_test_content(
     """)
 
 
-def generate_tests(test_specs: list[_TestSpec], tests_dir: str = "tests") -> None:
+def generate_tests(test_specs: list[_TestSpec], tests_dir: str = _DEFAULT_TESTS_DIR) -> None:
     """Write pytest files for each class that passed validation."""
     for spec in test_specs:
         if not spec.passed_validation:

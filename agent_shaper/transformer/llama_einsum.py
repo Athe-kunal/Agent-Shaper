@@ -1,26 +1,27 @@
-"""
-Llama transformer re-expressed with einsum and einops.
-
-Numerically identical to llama.py. Matrix contractions use einops.einsum
-and reshapes/transposes use einops.rearrange.
-Attribute names are kept identical to llama.py for load_state_dict compatibility.
-"""
-
 from dataclasses import dataclass
 from typing import Optional
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from einops import einsum as esum
+from einops import rearrange, repeat
 
-from agent_shaper.transformer.llama import (
-    ModelArgs,
-    precompute_theta_pos_frequencies,
-    apply_rotary_embeddings,
-    repeat_kv,
-)
+
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1
+    multiple_of: int = 256
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
+
+    device: str = None
 
 
 class RMSNorm(nn.Module):
@@ -33,9 +34,36 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor):
-        # (B, T, D) normed, then scale by weight (D,) via einsum Hadamard along D
-        normed = self._norm(x.float()).type_as(x)
-        return esum(normed, self.weight, "b t d, d -> b t d")
+        return self.weight * self._norm(x.float()).type_as(x)  # out: (batch_size, seq_len, dim)
+
+
+def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
+    assert head_dim % 2 == 0, "Dimension must be divisible by 2"
+    theta_numerator = torch.arange(0, head_dim, 2).float()
+    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)
+    m = torch.arange(seq_len, device=device)
+    freqs = torch.outer(m, theta).float()
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_complex
+
+
+def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # x_complex: (batch_size, seq_len, n_heads, head_dim/2)
+    freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)  # freqs_complex: (1, seq_len, 1, head_dim/2)
+    x_rotated = x_complex * freqs_complex  # x_rotated: (batch_size, seq_len, n_heads, head_dim/2)
+    x_out = torch.view_as_real(x_rotated)  # x_out: (batch_size, seq_len, n_heads, head_dim/2, 2)
+    x_out = x_out.reshape(*x.shape)  # x_out: (batch_size, seq_len, n_heads, head_dim)
+    return x_out.type_as(x).to(device)
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return x
+    # (b, s, kv_heads, d) → (b, s, kv_heads * n_rep, d)
+    return rearrange(
+        repeat(x, 'b s h d -> b s h r d', r=n_rep),
+        'b s h r d -> b s (h r) d',
+    )
 
 
 class SelfAttention(nn.Module):
@@ -52,52 +80,42 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
         batch_size, seq_len, _ = x.shape
 
-        # Project Q, K, V — einsum: b t d, o d -> b t o
-        xq = esum(x, self.wq.weight, "b t d, o d -> b t o")
-        xk = esum(x, self.wk.weight, "b t d, o d -> b t o")
-        xv = esum(x, self.wv.weight, "b t d, o d -> b t o")
+        xq = rearrange(self.wq(x), 'b s (h d) -> b s h d', h=self.n_heads_q)  # xq: (batch_size, seq_len, n_heads, head_dim)
+        xk = rearrange(self.wk(x), 'b s (h d) -> b s h d', h=self.n_kv_heads)  # xk: (batch_size, seq_len, n_kv_heads, head_dim)
+        xv = rearrange(self.wv(x), 'b s (h d) -> b s h d', h=self.n_kv_heads)  # xv: (batch_size, seq_len, n_kv_heads, head_dim)
 
-        # Reshape to per-head layout — rearrange: (B, T, H*D) -> (B, T, H, D)
-        xq = rearrange(xq, "b t (h d) -> b t h d", h=self.n_heads_q)
-        xk = rearrange(xk, "b t (h d) -> b t h d", h=self.n_kv_heads)
-        xv = rearrange(xv, "b t (h d) -> b t h d", h=self.n_kv_heads)
+        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)  # xq: (batch_size, seq_len, n_heads, head_dim)
+        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)  # xk: (batch_size, seq_len, n_kv_heads, head_dim)
 
-        xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
-        xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
+        cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
 
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
+        keys = cache_k[:batch_size, : start_pos + seq_len]  # keys: (batch_size, seq_len, n_kv_heads, head_dim)
+        values = cache_v[:batch_size, : start_pos + seq_len]  # values: (batch_size, seq_len, n_kv_heads, head_dim)
 
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]    # (B, kT, Hkv, D)
-        values = self.cache_v[:batch_size, : start_pos + seq_len]  # (B, kT, Hkv, D)
+        keys = repeat_kv(keys, self.n_rep)  # keys: (batch_size, seq_len, n_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # values: (batch_size, seq_len, n_heads, head_dim)
 
-        keys = repeat_kv(keys, self.n_rep)      # (B, kT, H, D)
-        values = repeat_kv(values, self.n_rep)  # (B, kT, H, D)
+        xq = rearrange(xq, 'b s h d -> b h s d')  # xq: (batch_size, n_heads, seq_len, head_dim)
+        keys = rearrange(keys, 'b t h d -> b h t d')  # keys: (batch_size, n_heads, seq_len, head_dim)
+        values = rearrange(values, 'b t h d -> b h t d')  # values: (batch_size, n_heads, seq_len, head_dim)
 
-        # Transpose to (B, H, T, D) for attention — rearrange
-        xq = rearrange(xq, "b t h d -> b h t d")
-        keys = rearrange(keys, "b t h d -> b h t d")
-        values = rearrange(values, "b t h d -> b h t d")
+        scores = torch.einsum('b h s d, b h t d -> b h s t', xq, keys) / math.sqrt(self.head_dim)  # scores: (batch_size, n_heads, seq_len, seq_len)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)  # scores: (batch_size, n_heads, seq_len, seq_len)
 
-        # Attention scores — einsum: b h q d, b h k d -> b h q k
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = esum(xq, keys, "b h q d, b h k d -> b h q k") * scale
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-
-        # Context — einsum: b h q k, b h k d -> b h q d
-        output = esum(scores, values, "b h q k, b h k d -> b h q d")
-
-        # Merge heads — rearrange: (B, H, T, D) -> (B, T, H*D)
-        output = rearrange(output, "b h t d -> b t (h d)")
-
-        # Output projection — einsum: b t c, d c -> b t d
-        return esum(output, self.wo.weight, "b t c, d c -> b t d")
+        output = torch.einsum('b h s t, b h t d -> b h s d', scores, values)  # output: (batch_size, n_heads, seq_len, head_dim)
+        output = rearrange(output, 'b h s d -> b s (h d)')  # output: (batch_size, seq_len, dim)
+        return self.wo(output)  # out: (batch_size, seq_len, dim)
 
 
 class FeedForward(nn.Module):
@@ -115,13 +133,11 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
-        # SwiGLU: silu(w1(x)) * w3(x), then project down with w2
-        # einsum: b t d, h d -> b t h  (expand)
-        swish = F.silu(esum(x, self.w1.weight, "b t d, h d -> b t h"))
-        x_V = esum(x, self.w3.weight, "b t d, h d -> b t h")
-        x = swish * x_V
-        # einsum: b t h, d h -> b t d  (contract)
-        return esum(x, self.w2.weight, "b t h, d h -> b t d")
+        swish = F.silu(self.w1(x))  # swish: (batch_size, seq_len, hidden_dim)
+        x_V = self.w3(x)  # x_V: (batch_size, seq_len, hidden_dim)
+        x = swish * x_V  # x: (batch_size, seq_len, hidden_dim)
+        x = self.w2(x)  # x: (batch_size, seq_len, dim)
+        return x
 
 
 class EncoderBlock(nn.Module):
@@ -139,11 +155,16 @@ class EncoderBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-        h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_complex
-        )
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex, cache_k, cache_v)  # h: (batch_size, seq_len, dim)
+        out = h + self.feed_forward.forward(self.ffn_norm(h))  # out: (batch_size, seq_len, dim)
         return out
 
 
@@ -172,16 +193,26 @@ class Transformer(nn.Module):
             device=self.args.device,
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+        n_kv_heads = args.n_kv_heads if args.n_kv_heads is not None else args.n_heads
+        head_dim = args.dim // args.n_heads
+        self.cache_shape = (args.n_layers, args.max_batch_size, args.max_seq_len, n_kv_heads, head_dim)
+
+    def make_cache(self, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate a fresh (cache_k, cache_v) pair for inference."""
+        return (
+            torch.zeros(self.cache_shape, device=device),
+            torch.zeros(self.cache_shape, device=device),
+        )
+
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache_k: torch.Tensor, cache_v: torch.Tensor):
         batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
 
-        h = self.tok_embeddings(tokens)  # (B, T, D)
-        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        h = self.tok_embeddings(tokens)  # h: (batch_size, seq_len, dim)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_complex)
-        h = self.norm(h)
+        freqs_complex = self.freqs_complex[start_pos : start_pos + seq_len]  # freqs_complex: (seq_len, head_dim/2)
 
-        # Output projection — einsum: b t d, v d -> b t v
-        return esum(h, self.output.weight, "b t d, v d -> b t v").float()
+        for i, layer in enumerate(self.layers):
+            h = layer(h, start_pos, freqs_complex, cache_k[i], cache_v[i])  # h: (batch_size, seq_len, dim)
+        h = self.norm(h)  # h: (batch_size, seq_len, dim)
+        output = self.output(h).float()  # output: (batch_size, seq_len, vocab_size)
+        return output
