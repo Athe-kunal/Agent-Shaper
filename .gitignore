@@ -222,3 +222,5 @@ __marimo__/
 llms-full.txt
 
 tests/
+
+agent_shaper_tests/

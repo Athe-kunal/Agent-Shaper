@@ -84,6 +84,9 @@ def _format_module(m: ModuleInfo) -> str:
         f"  [module] {m.class_name}  [{m.module_origin}]  L{m.line_start}–{m.line_end}  {m.source_file}",
         sep,
     ]
+    if m.input_shapes:
+        lines.append(f"  forward() entry  (L{m.forward_line_start}):")
+        lines.extend(_format_tensor(t) for t in m.input_shapes)
     if m.parameters:
         lines.append("  Parameters:")
         lines.extend(_format_tensor(t) for t in m.parameters)
@@ -100,6 +103,9 @@ def _format_function(f: FunctionInfo) -> str:
         f"  [function] {f.func_name}  L{f.line_start}–{f.line_end}  {f.source_file}",
         sep,
     ]
+    if f.input_shapes:
+        lines.append("  Entry shapes:")
+        lines.extend(_format_tensor(t) for t in f.input_shapes)
     if f.tensors:
         lines.append("  Tensors:")
         lines.extend(_format_tensor(t) for t in f.tensors)
@@ -111,7 +117,14 @@ def _exec_script(script: str) -> dict:
     ns: dict = {"__builtins__": __builtins__}
     if _WORKSPACE not in sys.path:
         sys.path.insert(0, _WORKSPACE)
-    exec(textwrap.dedent(script), ns)  # noqa: S102
+    # Write to a real temp file so torch.export stack traces record a readable
+    # path — without this the frame shows as "<string>" and Pass 2 can't parse
+    # the call-site line to detect workspace function calls.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+        tmp.write(textwrap.dedent(script))
+        tmp_path = tmp.name
+    code = compile(textwrap.dedent(script), tmp_path, "exec")
+    exec(code, ns)  # noqa: S102
     return ns
 
 
@@ -140,6 +153,7 @@ def _resolve_func_infos(
                 line_start=line_start,
                 line_end=line_end,
                 tensors=[],
+                input_shapes=[],
             ))
         else:
             missing.append(name)
@@ -289,6 +303,10 @@ def _ensure_einops_imports(file_src: str, class_src: str) -> str:
     lines = file_src.splitlines(keepends=True)
     last_import_idx = 0
     for i, line in enumerate(lines):
+        # Only count module-level (unindented) imports to avoid matching
+        # local imports inside function bodies.
+        if line[:1] in (' ', '\t'):
+            continue
         stripped = line.strip()
         if re.match(r"^(import |from \S+ import )", stripped):
             last_import_idx = i
@@ -353,6 +371,50 @@ def get_fx_shapes(
     return "\n".join(sections)
 
 
+def _snippet_with_entry_comment(
+    snippet: str,
+    input_shapes: list,
+    def_keyword: str,
+) -> str:
+    """Insert entry shape comment block after the first line matching def_keyword.
+
+    Handles multi-line def signatures (searches for the closing ':' line).
+    Detects body indentation from the first non-empty line after the def.
+    """
+    if not input_shapes:
+        return snippet
+
+    lines = snippet.splitlines(keepends=True)
+    def_idx = next(
+        (i for i, ln in enumerate(lines) if def_keyword in ln),
+        None,
+    )
+    if def_idx is None:
+        return snippet
+
+    # Walk forward to find the line ending the def signature with ':'
+    insert_at = def_idx + 1
+    for i in range(def_idx, len(lines)):
+        if lines[i].rstrip().endswith(":"):
+            insert_at = i + 1
+            break
+
+    # Detect body indentation from the first non-empty body line
+    indent_str = "    "
+    for ln in lines[insert_at:]:
+        stripped = ln.lstrip()
+        if stripped:
+            indent_str = " " * (len(ln) - len(stripped))
+            break
+
+    comment_lines = [
+        f"{indent_str}# {t.name}: {t.annotated_shape or t.shape}"
+        f"{'  ' + str(t.dtype) if t.dtype else ''}\n"
+        for t in input_shapes
+    ]
+    return "".join(lines[:insert_at] + comment_lines + lines[insert_at:])
+
+
 @mcp.tool()
 def get_annotated_sources(
     script: str,
@@ -389,7 +451,7 @@ def get_annotated_sources(
 
     # Merged FX + eager-trace line map from get_fx_data.
     dim_names = _ns.get("dim_names")
-    full_line_map = get_annotated_line_map(
+    full_line_map, enriched_functions = get_annotated_line_map(
         model, example_args, workspace=_WORKSPACE, dim_names=dim_names
     )
     file_to_annotations: dict[str, dict[int, list]] = defaultdict(dict)
@@ -401,31 +463,42 @@ def get_annotated_sources(
         m for m in shape_result.modules
         if m.source_file and os.path.abspath(m.source_file) in requested
     ]
+    # Use enriched_functions (have input_shapes) filtered to requested files.
+    enriched_map = {f.func_name: f for f in enriched_functions}
     functions = [
-        f for f in shape_result.functions
+        enriched_map.get(f.func_name, f)
+        for f in shape_result.functions
         if f.source_file and os.path.abspath(f.source_file) in requested
     ]
 
-    # For files with no traced coverage, fall back to the workspace function registry.
-    # This makes function-only files usable even when their functions aren't reached
-    # by the FX tracer's workspace-frame detection.
+    # Fall back to the workspace function registry for two cases:
+    # 1. Fully uncovered files (no FX coverage at all).
+    # 2. Partially covered files where some functions were missed by FX (e.g. because
+    #    their ops run under torch.no_grad() and are dropped from the export graph) but
+    #    were captured by the eager sys.settrace tracer — those appear in enriched_map.
+    fx_found_names = {f.func_name for f in shape_result.functions}
+    registry = _build_workspace_func_registry(_WORKSPACE)
     covered = (
         {os.path.abspath(m.source_file) for m in modules if m.source_file}
         | {os.path.abspath(f.source_file) for f in functions if f.source_file}
     )
     uncovered = requested - covered
-    if uncovered:
-        registry = _build_workspace_func_registry(_WORKSPACE)
-        for func_name, locations in registry.items():
-            for abs_file, rel_file, line_start, line_end in locations:
-                if abs_file in uncovered:
-                    functions.append(FunctionInfo(
-                        func_name=func_name,
-                        source_file=rel_file,
-                        line_start=line_start,
-                        line_end=line_end,
-                        tensors=[],
-                    ))
+    for func_name, locations in registry.items():
+        for abs_file, rel_file, line_start, line_end in locations:
+            if abs_file not in requested:
+                continue
+            eager_fi = enriched_map.get(func_name)
+            in_uncovered = abs_file in uncovered
+            eager_only = func_name not in fx_found_names and eager_fi is not None
+            if in_uncovered or eager_only:
+                functions.append(FunctionInfo(
+                    func_name=func_name,
+                    source_file=rel_file,
+                    line_start=line_start,
+                    line_end=line_end,
+                    tensors=eager_fi.tensors if eager_fi else [],
+                    input_shapes=eager_fi.input_shapes if eager_fi else [],
+                ))
 
     if not modules and not functions:
         return "No workspace modules or functions found in the specified files."
@@ -463,6 +536,7 @@ def get_annotated_sources(
         seen.add(key)
         ann_lines = file_annotated_lines[info.source_file]
         snippet = "".join(ann_lines[info.line_start - 1 : info.line_end])
+        snippet = _snippet_with_entry_comment(snippet, info.input_shapes, "def forward")
         sections.append(
             f"{sep}\n"
             f"  [module] {info.class_name}  "
@@ -480,6 +554,9 @@ def get_annotated_sources(
         seen.add(key)
         ann_lines = file_annotated_lines[info.source_file]
         snippet = "".join(ann_lines[info.line_start - 1 : info.line_end])
+        snippet = _snippet_with_entry_comment(
+            snippet, info.input_shapes, f"def {info.func_name}"
+        )
         sections.append(
             f"{sep}\n"
             f"  [function] {info.func_name}  "
@@ -490,6 +567,14 @@ def get_annotated_sources(
 
     dep_lines = "\n".join(f"  {i+1}. {cls}" for i, cls in enumerate(dep_order))
     header = f"Rewrite order (leaves → composites — rewrite top-to-bottom):\n{dep_lines}"
+
+    if dim_names:
+        dim_str = ", ".join(f"{k}={v}" for k, v in dim_names.items())
+        header = (
+            f"Symbolic dims (dummy values used for tracing only — "
+            f"shapes like (B, T) are structural, not tied to these exact numbers): {dim_str}\n\n"
+            + header
+        )
 
     # Warn about workspace nn.Module classes in the requested files that could not
     # be traced by either torch.export or the symbolic_trace fallback.

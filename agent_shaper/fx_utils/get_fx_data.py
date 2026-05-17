@@ -17,6 +17,7 @@ from collections import defaultdict
 from typing import NamedTuple, Optional, Tuple
 
 import torch
+import torch.fx
 import torch.nn as nn
 from torch.fx.passes.shape_prop import ShapeProp
 
@@ -24,10 +25,11 @@ from torch.fx.passes.shape_prop import ShapeProp
 class TensorInfo(NamedTuple):
     name: str
     shape: Optional[Tuple[int, ...]]
-    annotated_shape: Optional[str]   # "(B, T, n_embd)" when dim_names supplied, else None
+    annotated_shape: Optional[str]        # "(B, T, n_embd)" when dim_names supplied, else None
     dtype: Optional[torch.dtype]
     source_file: Optional[str]
     line_number: Optional[int]
+    input_annotated_shape: Optional[str]  # shape of first input tensor, used to show chain entry
 
 
 class ModuleInfo(NamedTuple):
@@ -36,8 +38,10 @@ class ModuleInfo(NamedTuple):
     source_file: Optional[str]
     line_start: Optional[int]
     line_end: Optional[int]
+    forward_line_start: Optional[int]  # line of `def forward(self, ...)` inside the class
     parameters: list   # list[TensorInfo] — nn.Parameters from __init__
     tensors: list      # list[TensorInfo] — every intermediate FX node in forward
+    input_shapes: list  # list[TensorInfo] — entry shapes for forward()'s tensor parameters
 
 
 class FunctionInfo(NamedTuple):
@@ -46,6 +50,7 @@ class FunctionInfo(NamedTuple):
     line_start: Optional[int]
     line_end: Optional[int]
     tensors: list      # list[TensorInfo] — FX nodes attributed to this function
+    input_shapes: list  # list[TensorInfo] — entry shapes for the function's tensor parameters
 
 
 class ShapeResult(NamedTuple):
@@ -119,6 +124,24 @@ def _node_callsites(node, workspace: str) -> list[tuple[str, int]]:
     for f, line in reversed(re.findall(r'File "([^"]+)", line (\d+)', trace)):
         abs_f = os.path.abspath(f)
         if abs_f.startswith(workspace) and "site-packages" not in abs_f:
+            result.append((abs_f, int(line)))
+    return result
+
+
+def _node_all_callsites(node) -> list[tuple[str, int]]:
+    """Return all (abs_file, line_no) non-site-packages frames from stack_trace, innermost first.
+
+    Like _node_callsites but includes non-workspace frames (e.g. exec'd scripts).
+    Used in Pass 2 to find call-site lines that name workspace registry functions
+    even when the caller lives outside the workspace directory.
+    """
+    trace = node.meta.get("stack_trace", "")
+    if not trace:
+        return []
+    result = []
+    for f, line in reversed(re.findall(r'File "([^"]+)", line (\d+)', trace)):
+        abs_f = os.path.abspath(f)
+        if "site-packages" not in abs_f:
             result.append((abs_f, int(line)))
     return result
 
@@ -212,6 +235,51 @@ def _cls_meta(cls):
         src_lines, start, src_file, abs_file = [], None, None, None
     end = (start + len(src_lines) - 1) if start is not None else None
     return src_lines, start, end, src_file, abs_file
+
+
+def _forward_line_start(cls) -> Optional[int]:
+    """Return the 1-based line number of `def forward(self, ...)` in cls, or None."""
+    try:
+        _, line = inspect.getsourcelines(cls.forward)
+        return line
+    except (OSError, TypeError):
+        return None
+
+
+def _make_forward_input_shapes(
+    cls,
+    args: tuple,
+    src_file: Optional[str],
+    forward_line: Optional[int],
+    dynamic_val_to_name: dict,
+    static_val_to_name: dict,
+) -> list:
+    """Return [TensorInfo] for each tensor argument to forward(), in parameter order.
+
+    Skips `self` — only the actual data arguments are returned.
+    Only meaningful for the root module where args == example_args.
+    """
+    try:
+        params = [
+            p for p in inspect.signature(cls.forward).parameters.keys()
+            if p != "self"
+        ]
+    except (ValueError, TypeError):
+        return []
+    shapes = []
+    for name, arg in zip(params, args):
+        if not isinstance(arg, torch.Tensor):
+            continue
+        shapes.append(TensorInfo(
+            name=name,
+            shape=tuple(arg.shape),
+            annotated_shape=_make_eager_annotated_shape(arg, dynamic_val_to_name, static_val_to_name),
+            dtype=arg.dtype,
+            source_file=src_file,
+            line_number=forward_line,
+            input_annotated_shape=None,
+        ))
+    return shapes
 
 
 def _node_op_name(node) -> str:
@@ -311,7 +379,7 @@ def _build_dynamic_shapes(
     after torch.export raises ConstraintViolationError with suggested fixes).
     """
     val_to_name: dict[int, str] = {}
-    for name, val in dim_names.items():
+    for name, val in (dim_names or {}).items():
         if val in val_to_name:
             raise ValueError(
                 f"dim_names collision: '{name}' and '{val_to_name[val]}' both have value {val}. "
@@ -321,7 +389,7 @@ def _build_dynamic_shapes(
 
     dims = {
         name: torch.export.Dim(name, **((dim_bounds or {}).get(name, {})))
-        for name in dim_names
+        for name in (dim_names or {})
     }
 
     sig = inspect.signature(module.forward)
@@ -357,11 +425,30 @@ def _node_annotated_shape(
     """
     def _fmt_dim(d) -> str:
         if isinstance(d, torch.SymInt):
-            # SymInts from torch.export already carry the correct symbolic
-            # expression (e.g. seq_len - 1 from [:, :-1, :]) — use it directly.
-            return dynamic_val_to_name.get(d.node.hint, str(d))
-        if d in dynamic_val_to_name:
-            return dynamic_val_to_name[d]
+            # Fast path: hint matches a named dynamic dim directly.
+            if d.node.hint in dynamic_val_to_name:
+                return dynamic_val_to_name[d.node.hint]
+            # Derived expressions like `seq_len - 1`: the sympy expr is
+            # `symbol + offset` where offset is a negative integer. Recover the
+            # base hint as `d.node.hint - offset` and look that up.
+            try:
+                expr = d.node.expr
+                if expr.is_Add:
+                    int_parts = [a for a in expr.args if a.is_Integer]
+                    if len(int_parts) == 1:
+                        offset = int(int_parts[0])
+                        base_hint = d.node.hint - offset
+                        if base_hint in dynamic_val_to_name:
+                            name = dynamic_val_to_name[base_hint]
+                            return f"{name} + {offset}" if offset >= 0 else f"{name} - {abs(offset)}"
+            except Exception:
+                pass
+            return str(d)
+        # Plain ints are always fixed structural values (e.g. n_head, n_embd).
+        # Dynamic dims (B, T) are SymInts in torch.export — never plain ints —
+        # so we must NOT look them up in dynamic_val_to_name here. Doing so
+        # causes collisions when a static attr (e.g. n_head=2) shares a value
+        # with a dynamic dim (e.g. B=2), mislabelling n_head as B.
         if d in static_val_to_name:
             return static_val_to_name[d]
         return str(d)
@@ -378,6 +465,14 @@ def _node_annotated_shape(
     if not hasattr(val, "shape"):
         return None
     return _fmt_shape(val.shape)
+
+
+def _first_tensor_arg_annotated_shape(node, dynamic_val_to_name: dict, static_val_to_name: dict) -> Optional[str]:
+    """Return the annotated shape of the first tensor input to node, or None."""
+    for arg in node.args:
+        if isinstance(arg, torch.fx.Node):
+            return _node_annotated_shape(arg, dynamic_val_to_name, static_val_to_name)
+    return None
 
 
 def _hashable_shape(shape):
@@ -398,11 +493,14 @@ def _collect_module_attr_names(
 ) -> dict[int, str]:
     """Return {int_value: attr_name} from integer attributes of all workspace submodules.
 
-    Skips values already used by dynamic dims (user-supplied via dim_names) so that
-    a static attribute whose value happens to equal a dynamic dim (e.g. n_head=2 when B=2)
-    is never confused with that dynamic dim in annotations.
     Only collects positive integers > 1 to avoid noise from flags and indices.
     First attribute name seen wins when multiple attrs share the same value.
+
+    Dynamic dim values (B, T etc.) are intentionally NOT excluded here. In
+    torch.export those dims are SymInts, so _node_annotated_shape never looks up
+    plain ints in dynamic_val_to_name — there is no collision risk for FX
+    annotations. Keeping n_head=2 in this dict (even when B=2) ensures the dim
+    is labelled "n_head" rather than the raw integer 2.
     """
     result: dict[int, str] = {}
 
@@ -412,7 +510,7 @@ def _collect_module_attr_names(
         for attr, val in vars(sub_mod).items():
             if not isinstance(val, int) or val <= 1 or attr.startswith("_"):
                 continue
-            if val in dynamic_values or val in result:
+            if val in result:
                 continue
             result[val] = attr
 
@@ -471,6 +569,7 @@ def _trace_function_lines(
     """
     result: defaultdict = defaultdict(list)
     seen: set = set()
+    func_entry_shapes: dict = {}
 
     # Per-frame state: {frame_id: (prev_lineno, prev_locals_snapshot)}
     frame_state: dict = {}
@@ -493,17 +592,43 @@ def _trace_function_lines(
                 dtype=val.dtype,
                 source_file=rel_file,
                 line_number=lineno,
+                input_annotated_shape=None,
             ))
 
     def tracer(frame, event, arg):
-        if event not in ("line", "return"):
-            return tracer
         filename = frame.f_code.co_filename
         abs_file = os.path.abspath(filename)
         if not abs_file.startswith(workspace) or "site-packages" in abs_file:
             return tracer
 
         rel_file = os.path.relpath(abs_file)
+
+        if event == "call":
+            # Capture entry shapes for standalone functions (no `self` → not a method).
+            func_name = frame.f_code.co_name
+            if "self" not in frame.f_locals and func_name not in func_entry_shapes:
+                entry = [
+                    TensorInfo(
+                        name=k,
+                        shape=tuple(v.shape),
+                        annotated_shape=_make_eager_annotated_shape(
+                            v, dynamic_val_to_name, static_val_to_name
+                        ),
+                        dtype=v.dtype,
+                        source_file=rel_file,
+                        line_number=frame.f_lineno,
+                        input_annotated_shape=None,
+                    )
+                    for k, v in frame.f_locals.items()
+                    if isinstance(v, torch.Tensor) and not k.startswith("_")
+                ]
+                if entry:
+                    func_entry_shapes[func_name] = entry
+            return tracer
+
+        if event not in ("line", "return"):
+            return tracer
+
         curr_lineno = frame.f_lineno
         fid = id(frame)
 
@@ -533,7 +658,7 @@ def _trace_function_lines(
         finally:
             sys.settrace(old_trace)
 
-    return dict(result)
+    return dict(result), func_entry_shapes
 
 
 # ─── Line-map builder ─────────────────────────────────────────────────────────
@@ -593,8 +718,15 @@ def get_module_shapes(
 
     dynamic_shapes = _build_dynamic_shapes(module, example_args, dim_names)
     dynamic_val_to_name: dict[int, str] = {v: k for k, v in (dim_names or {}).items()}
-    static_val_to_name = _collect_module_attr_names(
-        path_to_module, workspace, set(dynamic_val_to_name)
+    # FX annotations: SymInt handles dynamic dims, so plain ints can safely map to
+    # static attrs (e.g. n_head=2) even when a dynamic dim shares the same value.
+    static_val_to_name_fx = _collect_module_attr_names(
+        path_to_module, workspace, dynamic_values=set()
+    )
+    # Eager annotations (entry shapes from example_args): all dims are plain ints,
+    # so exclude values already claimed by dynamic dims to avoid mislabelling B as n_head.
+    static_val_to_name_eager = _collect_module_attr_names(
+        path_to_module, workspace, dynamic_values=set(dynamic_val_to_name)
     )
 
     cache_key = _export_cache_key(module, example_args)
@@ -659,10 +791,13 @@ def get_module_shapes(
         t = TensorInfo(
             name=tensor_name,
             shape=shape,
-            annotated_shape=_node_annotated_shape(node, dynamic_val_to_name, static_val_to_name),
+            annotated_shape=_node_annotated_shape(node, dynamic_val_to_name, static_val_to_name_fx),
             dtype=dtype,
             source_file=src_file,
             line_number=line_no,
+            input_annotated_shape=_first_tensor_arg_annotated_shape(
+                node, dynamic_val_to_name, static_val_to_name_fx
+            ),
         )
         if key not in mod_key_to_tensors:
             mod_seen_keys.append(key)
@@ -691,18 +826,31 @@ def get_module_shapes(
                     dtype=p.dtype,
                     source_file=src_file,
                     line_number=_param_line(src_lines, start, name) if start is not None else None,
+                    input_annotated_shape=None,
                 )
                 for name, p in mod.named_parameters(recurse=False)
             ]
 
+        fwd_line = _forward_line_start(cls)
+        # Input shapes from example_args are only correct for the root module.
+        # Submodules receive intermediate tensors that we don't have here.
+        input_shapes = (
+            _make_forward_input_shapes(
+                cls, example_args, src_file, fwd_line, dynamic_val_to_name, static_val_to_name_eager
+            )
+            if not origin  # origin is "" or None for the root module
+            else []
+        )
         modules.append(ModuleInfo(
             class_name=cls.__name__,
             module_origin=origin or "root",
             source_file=src_file,
             line_start=start,
             line_end=end,
+            forward_line_start=fwd_line,
             parameters=params,
             tensors=tensors,
+            input_shapes=input_shapes,
         ))
 
     # ── Pass 2: attribute FX nodes to workspace standalone functions ────────────
@@ -714,13 +862,13 @@ def get_module_shapes(
     func_key_meta: dict[tuple, tuple] = {}  # (abs_file, func_name) -> (rel_file, line_start, line_end)
 
     for node in gm.graph.nodes:
-        # Walk workspace frames from innermost outward; stop at the first frame
-        # whose source line names a registry function.  This handles both the
-        # standard case (workspace forward() calls a workspace function — innermost
-        # frame is the call site) and the exec-script wrapper case (non-workspace
-        # forward() calls workspace functions — innermost frames are inside function
-        # bodies; the relevant call-site frame is one or more levels up).
-        for call_abs_file, call_line_no in _node_callsites(node, workspace):
+        # Walk all non-site-packages frames (workspace + exec scripts) innermost first;
+        # stop at the first frame whose source line names a registry function.
+        # Workspace frames cover the standard case (workspace forward() calls a workspace
+        # function). Non-workspace frames cover the exec-script case where Wrapper.forward
+        # lives outside the workspace — the call site line naming compute_logprobs() is
+        # in the exec script, not inside the function body.
+        for call_abs_file, call_line_no in _node_all_callsites(node):
             src_lines = get_src_lines(call_abs_file)
             called_names = _free_func_names_at_line(src_lines, call_line_no)
 
@@ -746,10 +894,11 @@ def get_module_shapes(
                     t = TensorInfo(
                         name=node.name,
                         shape=shape,
-                        annotated_shape=_node_annotated_shape(node, dynamic_val_to_name, static_val_to_name),
+                        annotated_shape=_node_annotated_shape(node, dynamic_val_to_name, static_val_to_name_fx),
                         dtype=dtype,
                         source_file=rel_func_file,
                         line_number=body_line,
+                        input_annotated_shape=None,
                     )
                     if key not in func_key_to_tensors:
                         func_seen_keys.append(key)
@@ -776,6 +925,7 @@ def get_module_shapes(
             line_start=line_start,
             line_end=line_end,
             tensors=tensors,
+            input_shapes=[],  # populated later by _trace_function_lines in get_annotated_line_map
         ))
 
     return ShapeResult(modules=modules, functions=functions)
@@ -786,8 +936,8 @@ def get_annotated_line_map(
     example_args: tuple,
     workspace: Optional[str] = None,
     dim_names: Optional[dict[str, int]] = None,
-) -> dict[tuple, list]:
-    """Return a merged {(rel_file, lineno): [TensorInfo]} from FX tracing and eager line tracing.
+) -> tuple:
+    """Return (line_map, enriched_functions) from FX tracing and eager line tracing.
 
     FX tracing (torch.export) provides per-module tensor shapes with symbolic dim names.
     Eager line tracing (sys.settrace) fills in per-line shapes for standalone functions
@@ -807,8 +957,11 @@ def get_annotated_line_map(
 
     Returns
     -------
-    dict mapping (rel_file, lineno) -> list[TensorInfo], covering both module
-    and standalone-function lines.
+    (line_map, enriched_functions) where:
+      line_map          — {(rel_file, lineno): [TensorInfo]}, covering both module
+                          and standalone-function lines.
+      enriched_functions — list[FunctionInfo] with input_shapes populated from
+                          the eager tracer's 'call' event captures.
     """
     workspace = workspace or os.getcwd()
     shape_result = get_module_shapes(module, example_args, workspace=workspace, dim_names=dim_names)
@@ -816,17 +969,19 @@ def get_annotated_line_map(
     # FX-based line map (modules + any FX-visible function nodes)
     line_map = _build_line_map_from_result(shape_result)
 
-    # Eager line tracer for standalone function bodies
+    # Eager line tracer for standalone function bodies and entry shapes.
     dynamic_val_to_name: dict[int, str] = {v: k for k, v in (dim_names or {}).items()}
     path_to_module = dict(module.named_modules())
-    static_val_to_name = _collect_module_attr_names(
-        path_to_module, workspace, set(dynamic_val_to_name)
+    # Eager tracer sees only plain ints — exclude dynamic dim values so that a
+    # static attr (n_head=2) sharing a value with B=2 is not mislabelled.
+    static_val_to_name_eager = _collect_module_attr_names(
+        path_to_module, workspace, dynamic_values=set(dynamic_val_to_name)
     )
-    eager_map = _trace_function_lines(
-        module, example_args, workspace, dynamic_val_to_name, static_val_to_name
+    eager_map, func_entry_shapes = _trace_function_lines(
+        module, example_args, workspace, dynamic_val_to_name, static_val_to_name_eager
     )
 
-    # Merge: eager entries supplement FX entries; don't overwrite existing names
+    # Merge: eager entries supplement FX entries; don't overwrite existing names.
     seen_existing: dict[tuple, set] = {}
     for (src_file, lineno), tensors in line_map.items():
         seen_existing[(src_file, lineno)] = {t.name for t in tensors}
@@ -842,7 +997,20 @@ def get_annotated_line_map(
         else:
             merged[(src_file, lineno)] = new_tensors
 
-    return merged
+    # Enrich FunctionInfo objects with entry shapes from the eager tracer.
+    enriched_functions = [
+        FunctionInfo(
+            func_name=fi.func_name,
+            source_file=fi.source_file,
+            line_start=fi.line_start,
+            line_end=fi.line_end,
+            tensors=fi.tensors,
+            input_shapes=func_entry_shapes.get(fi.func_name, []),
+        )
+        for fi in shape_result.functions
+    ]
+
+    return merged, enriched_functions
 
 
 # ─── CLI smoke-test ───────────────────────────────────────────────────────────

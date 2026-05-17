@@ -23,12 +23,32 @@ def _base_var(name: str) -> str:
     return name.split(" [")[0] if " [" in name else name
 
 
+def _op_tag(name: str) -> str:
+    """Return the op suffix from a name like 'k [transpose]', or '' if none."""
+    if " [" in name and name.endswith("]"):
+        return name.split(" [", 1)[1][:-1]
+    return ""
+
+
+# Ops that are auxiliary decomposition artifacts from torch.export — not actual
+# transformations of the assignment-target tensor (e.g. bias slices inside masked_fill).
+_AUXILIARY_OPS = frozenset({
+    "slice", "select", "getitem", "index", "index_put",
+    "eq", "ne", "lt", "gt", "le", "ge",
+    "full", "scalar_tensor", "arange", "zeros", "ones",
+    "expand", "expand_as", "clone",
+})
+
+
 def _format_comment(tensors: list[TensorInfo]) -> str:
     """Format a list of TensorInfo at the same line into a comment string.
 
-    Consecutive tensors sharing the same base variable are joined with ' → '
-    to show shape transformations (e.g. k [view] and k [transpose] on one line).
-    Distinct variables are separated by '  |  '.
+    For each group sharing the same base variable:
+    - Filters out auxiliary decomposition ops (bias slices, comparisons, etc.)
+      that torch.export injects but don't represent the variable's transformation.
+    - Deduplicates consecutive identical shapes (e.g. contiguous() no-ops).
+    - Prepends the input shape of the first op so the full transformation is visible.
+    Groups are separated by '  |  '.
     """
     parts: list[str] = []
     i = 0
@@ -40,11 +60,28 @@ def _format_comment(tensors: list[TensorInfo]) -> str:
             chain.append(tensors[j])
             j += 1
 
-        if len(chain) > 1:
-            shapes = " → ".join(_shape_str(t) for t in chain)
-            parts.append(f"{base}: {shapes}")
+        # Filter auxiliary ops, but always keep the last node (actual assignment result).
+        filtered = [
+            t for t in chain[:-1]
+            if _op_tag(t.name) not in _AUXILIARY_OPS
+        ] + [chain[-1]]
+
+        # Build shape sequence: prepend input shape of first op, then output shapes.
+        shapes: list[str] = []
+        first = filtered[0]
+        if first.input_annotated_shape and first.input_annotated_shape != _shape_str(first):
+            shapes.append(first.input_annotated_shape)
+        for t in filtered:
+            s = _shape_str(t)
+            if not shapes or shapes[-1] != s:  # deduplicate consecutive same shapes
+                shapes.append(s)
+
+        if len(shapes) > 1:
+            parts.append(f"{base}: {' → '.join(shapes)}")
         else:
-            parts.append(f"{tensors[i].name}: {_shape_str(tensors[i])}")
+            shape_str = shapes[0] if shapes else _shape_str(chain[-1])
+            # Use plain name (no op tag) when nothing interesting to chain.
+            parts.append(f"{base}: {shape_str}")
 
         i = j
     return "  |  ".join(parts)

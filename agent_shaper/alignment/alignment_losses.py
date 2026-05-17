@@ -14,7 +14,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import reduce
+from einops import einsum, reduce
 
 
 def compute_logprobs(
@@ -40,19 +40,22 @@ def compute_logprobs(
     labels = labels[:, 1:]  # (batch, seq_len-1)
     mask = mask[:, 1:]  # (batch, seq_len-1)
 
-    # Compute per-token log probs
-    log_probs = F.log_softmax(logits, dim=-1)
-    per_token_logps = torch.gather(log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    log_probs = F.log_softmax(logits, dim=-1)  # (batch, seq_len-1, vocab)
+
+    # One-hot encode labels, then einsum to gather per-token log probs
+    one_hot = torch.zeros_like(log_probs).scatter_(-1, labels.unsqueeze(-1), 1.0)
+    per_token_logps = einsum(log_probs, one_hot, "b s v, b s v -> b s")
 
     # Mask out padding
-    per_token_logps = per_token_logps * mask
+    per_token_logps = einsum(per_token_logps, mask, "b s, b s -> b s")
 
     if average_log_prob:
         # SimPO or DPO-Norm: average over valid tokens to avoid length bias
         return per_token_logps.sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
     else:
         # DPO: sum over all tokens
-        return per_token_logps.sum(dim=-1)
+        ones = torch.ones(per_token_logps.shape[1], device=per_token_logps.device, dtype=per_token_logps.dtype)
+        return einsum(per_token_logps, ones, "b s, s -> b")
 
 
 class DPOLoss(nn.Module):
