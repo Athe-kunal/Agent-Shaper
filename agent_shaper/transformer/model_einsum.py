@@ -1,21 +1,11 @@
-"""
-GPT language model re-expressed with einsum and einops.
-
-Numerically identical to model.py. Every tensor contraction is an explicit
-named einsum (via einops.einsum) and every reshape/transpose uses
-einops.rearrange.  Attribute names are kept identical to model.py so that
-state-dicts are interchangeable via load_state_dict.
-"""
-
 import math
+import inspect
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from einops import rearrange
-from einops import einsum as esum
-
-from agent_shaper.transformer.model import GPTConfig
 
 
 class LayerNorm(nn.Module):
@@ -26,21 +16,11 @@ class LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, x):
-        # x: (B, T, C) -> (B, T, C)
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
 class CausalSelfAttention(nn.Module):
-    """
-    Multi-head causal self-attention using einops.
-
-    Contractions:
-      QKV project : b t c, d c -> b t d
-      Scores      : b h i d, b h j d -> b h i j
-      Context     : b h i j, b h j d -> b h i d
-      Out project : b t c, d c -> b t d
-    """
 
     def __init__(self, config):
         super().__init__()
@@ -52,57 +32,48 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size))
-            .view(1, 1, config.block_size, config.block_size),
-        )
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size))
+                .view(1, 1, config.block_size, config.block_size),
+            )
 
     def forward(self, x):
-        # x: (B, T, C)
         B, T, C = x.size()
-        H = self.n_head
 
-        # QKV projection — einsum: b t c, d c -> b t d  (d = 3C)
-        qkv = esum(x, self.c_attn.weight, "b t c, d c -> b t d")
-        if self.c_attn.bias is not None:
-            qkv = qkv + self.c_attn.bias
-        q, k, v = qkv.split(self.n_embd, dim=-1)  # each (B, T, C)
+        # (B, T, 3*C) -> (3, B, H, T, d_head), then unbind along dim 0
+        q, k, v = rearrange(
+            self.c_attn(x), "b t (three h d) -> three b h t d", three=3, h=self.n_head
+        ).unbind(0)
 
-        # Reshape to multi-head — rearrange: (B, T, C) -> (B, H, T, C/H)
-        q = rearrange(q, "b t (h d) -> b h t d", h=H)
-        k = rearrange(k, "b t (h d) -> b h t d", h=H)
-        v = rearrange(v, "b t (h d) -> b h t d", h=H)
+        if self.flash:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True,
+            )
+        else:
+            # att: (B, H, T, T)
+            scale = 1.0 / math.sqrt(k.size(-1))
+            att = torch.einsum("b h i d, b h j d -> b h i j", q, k) * scale
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            # y: (B, H, T, d_head)
+            y = torch.einsum("b h i j, b h j d -> b h i d", att, v)
 
-        # Attention scores — einsum: b h i d, b h j d -> b h i j
-        scale = 1.0 / math.sqrt(k.size(-1))
-        att = esum(q, k, "b h i d, b h j d -> b h i j") * scale
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        # Context vectors — einsum: b h i j, b h j d -> b h i d
-        y = esum(att, v, "b h i j, b h j d -> b h i d")
-
-        # Merge heads — rearrange: (B, H, T, C/H) -> (B, T, C)
+        # (B, H, T, d_head) -> (B, T, C)
         y = rearrange(y, "b h t d -> b t (h d)")
-
-        # Output projection — einsum: b t c, d c -> b t d
-        y = esum(y, self.c_proj.weight, "b t c, d c -> b t d")
-        if self.c_proj.bias is not None:
-            y = y + self.c_proj.bias
-        y = self.resid_dropout(y)
+        y = self.resid_dropout(self.c_proj(y))
         return y
 
 
 class MLP(nn.Module):
-    """
-    Feed-forward block using einops.
-
-    Contractions:
-      Expand   : b t c, d c -> b t d  (d = 4C)
-      Contract : b t c, d c -> b t d  (c = 4C, d = C)
-    """
 
     def __init__(self, config):
         super().__init__()
@@ -112,16 +83,9 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # x: (B, T, C)
-        # Expand — einsum: b t c, d c -> b t d  where d = 4C
-        x = esum(x, self.c_fc.weight, "b t c, d c -> b t d")
-        if self.c_fc.bias is not None:
-            x = x + self.c_fc.bias
+        x = self.c_fc(x)
         x = self.gelu(x)
-        # Contract — einsum: b t c, d c -> b t d  where c = 4C, d = C
-        x = esum(x, self.c_proj.weight, "b t c, d c -> b t d")
-        if self.c_proj.bias is not None:
-            x = x + self.c_proj.bias
+        x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
@@ -136,20 +100,23 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        # (B, T, C) throughout — residual stream
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 
-class GPTEinsum(nn.Module):
-    """
-    GPT re-implemented with einsum/einops; identical interface to GPT.
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True
 
-    lm_head contraction:
-      Training   : b t c, v c -> b t v
-      Inference  : b c, v c -> b v  (last position only)
-    """
+
+class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -169,8 +136,16 @@ class GPTEinsum(nn.Module):
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def get_num_params(self, non_embedding=True):
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -183,31 +158,115 @@ class GPTEinsum(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # (T,)
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        )
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        # Embeddings: lookup (B,T) -> (B,T,C) and (T,) -> (T,C)
-        tok_emb = self.transformer.wte(idx)          # (B, T, C)
-        pos_emb = self.transformer.wpe(pos)          # (T, C)
-        x = self.transformer.drop(tok_emb + pos_emb) # (B, T, C)
-
+        tok_emb = self.transformer.wte(idx)   # (B, T, n_embd)
+        pos_emb = self.transformer.wpe(pos)   # (T, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # Training: project all positions — einsum: b t c, v c -> b t v
-            logits = esum(x, self.lm_head.weight, "b t c, v c -> b t v")
+            # lm_head has no bias, so use einsum over vocab dim
+            logits = torch.einsum("b t e, v e -> b t v", x, self.lm_head.weight)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+                rearrange(logits, "b t v -> (b t) v"),
+                rearrange(targets, "b t -> (b t)"),
+                ignore_index=-1,
             )
         else:
-            # Inference: project last position only — einsum: b c, v c -> b v
-            x_last = x[:, -1, :]  # (B, C)
-            logits = esum(x_last, self.lm_head.weight, "b c, v c -> b v").unsqueeze(1)  # (B, 1, V)
+            logits = torch.einsum("b e, v e -> b v", x[:, -1, :], self.lm_head.weight)
+            logits = logits.unsqueeze(1)  # preserve time dim: (B, 1, vocab_size)
             loss = None
 
         return logits, loss
+
+    def crop_block_size(self, block_size):
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {}
+        assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        config_args = {
+            'gpt2':        dict(n_layer=12, n_head=12, n_embd=768),
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),
+            'gpt2-large':  dict(n_layer=36, n_head=20, n_embd=1280),
+            'gpt2-xl':     dict(n_layer=48, n_head=25, n_embd=1600),
+        }[model_type]
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config_args['bias'] = True
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = [k for k in sd.keys() if not k.endswith('.attn.bias')]
+
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12
+        return flops_achieved / flops_promised
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -217,7 +276,7 @@ class GPTEinsum(nn.Module):
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
+                logits[logits < v[:, [-1]]] = -float('Inf')
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
