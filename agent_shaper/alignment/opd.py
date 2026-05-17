@@ -3,6 +3,24 @@ from einops import einsum, rearrange
 from typing import Literal
 
 
+def _gather_logprobs(
+    logits: torch.Tensor,
+    idx: torch.Tensor,
+    lse: torch.Tensor,
+) -> torch.Tensor:
+    """Gather log-probs at idx positions using einsum over a one-hot encoding.
+    
+    Args:
+        logits: (B, C, V)
+        idx:    (B, C, K)
+        lse:    (B, C)
+    Returns:    (B, C, K)
+    """
+    V = logits.shape[-1]
+    one_hot = torch.zeros(*idx.shape, V, device=logits.device, dtype=logits.dtype).scatter_(-1, idx.unsqueeze(-1), 1.0)
+    return einsum(logits, one_hot, 'b c v, b c k v -> b c k') - rearrange(lse, 'b c -> b c 1')
+
+
 def _chunk_range(T: int, chunk: int):
     """Yield (start, end) pairs that partition [0, T) into slices of size `chunk`."""
     for t0 in range(0, T, chunk):
@@ -44,10 +62,7 @@ def teacher_logprobs_at_indices(
         for t0, t1 in _chunk_range(T, chunk):
             sl = teacher_logits[:, t0:t1]
             lse = torch.logsumexp(sl, dim=-1)
-            idx = topk_idx[:, t0:t1]
-            V = sl.shape[-1]
-            one_hot = torch.zeros(*idx.shape, V, device=sl.device, dtype=sl.dtype).scatter_(-1, idx.unsqueeze(-1), 1.0)
-            parts.append(einsum(sl, one_hot, "b c v, b c k v -> b c k") - rearrange(lse, "b c -> b c 1"))
+            parts.append(sl.gather(-1, topk_idx[:, t0:t1]) - lse.unsqueeze(-1))
     del teacher_logits
     return torch.cat(parts, dim=1)
 
@@ -67,9 +82,7 @@ def teacher_topk_logprobs(
             lse = torch.logsumexp(sl, dim=-1)
             _, idx = sl.topk(K, dim=-1)
             idx_parts.append(idx)
-            V = sl.shape[-1]
-            one_hot = torch.zeros(*idx.shape, V, device=sl.device, dtype=sl.dtype).scatter_(-1, idx.unsqueeze(-1), 1.0)
-            lp_parts.append(einsum(sl, one_hot, "b c v, b c k v -> b c k") - rearrange(lse, "b c -> b c 1"))
+            lp_parts.append(sl.gather(-1, idx) - lse.unsqueeze(-1))
     del teacher_logits
     return torch.cat(idx_parts, dim=1), torch.cat(lp_parts, dim=1)
 
@@ -86,10 +99,7 @@ def student_logprobs_at_indices(
     for t0, t1 in _chunk_range(T, chunk):
         sl = student_logits[:, t0:t1]
         lse = torch.logsumexp(sl, dim=-1)
-        idx = topk_idx[:, t0:t1]
-        V = sl.shape[-1]
-        one_hot = torch.zeros(*idx.shape, V, device=sl.device, dtype=sl.dtype).scatter_(-1, idx.unsqueeze(-1), 1.0)
-        parts.append(einsum(sl, one_hot, "b c v, b c k v -> b c k") - rearrange(lse, "b c -> b c 1"))
+        parts.append(sl.gather(-1, topk_idx[:, t0:t1]) - lse.unsqueeze(-1))
     return torch.cat(parts, dim=1)
 
 
@@ -110,11 +120,9 @@ def _topk_logprobs_slice(
         with torch.no_grad():
             _, topk_idx = t.topk(top_k, dim=-1)
 
-    V = s.shape[-1]
-    one_hot = torch.zeros(*topk_idx.shape, V, device=s.device, dtype=s.dtype).scatter_(-1, topk_idx.unsqueeze(-1), 1.0)
-    s_lp = einsum(s, one_hot, "b c v, b c k v -> b c k") - rearrange(s_lse, "b c -> b c 1")
+    s_lp = s.gather(-1, topk_idx) - s_lse.unsqueeze(-1)
     with torch.no_grad():
-        t_lp = einsum(t, one_hot, "b c v, b c k v -> b c k") - rearrange(t_lse, "b c -> b c 1")
+        t_lp = t.gather(-1, topk_idx) - t_lse.unsqueeze(-1)
 
     return s_lp, t_lp, topk_idx
 
