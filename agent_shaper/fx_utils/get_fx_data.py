@@ -327,17 +327,17 @@ def _build_dynamic_shapes(
     sig = inspect.signature(module.forward)
     param_names = list(sig.parameters.keys())
 
-    dynamic_shapes: dict[str, dict[int, object]] = {}
+    dynamic_shapes: dict[str, object] = {}
     for param_name, arg in zip(param_names, example_args):
         if not isinstance(arg, torch.Tensor):
+            dynamic_shapes[param_name] = None
             continue
         axis_map = {
             axis: dims[val_to_name[size]]
             for axis, size in enumerate(arg.shape)
             if size in val_to_name
         }
-        if axis_map:
-            dynamic_shapes[param_name] = axis_map
+        dynamic_shapes[param_name] = axis_map if axis_map else None
 
     return dynamic_shapes
 
@@ -357,17 +357,13 @@ def _node_annotated_shape(
     """
     def _fmt_dim(d) -> str:
         if isinstance(d, torch.SymInt):
+            # SymInts from torch.export already carry the correct symbolic
+            # expression (e.g. seq_len - 1 from [:, :-1, :]) — use it directly.
             return dynamic_val_to_name.get(d.node.hint, str(d))
-        # Exact match: declared dynamic dim forced static, or module attribute
         if d in dynamic_val_to_name:
             return dynamic_val_to_name[d]
         if d in static_val_to_name:
             return static_val_to_name[d]
-        # Derived: d = declared_dim ± small_offset (e.g. S-1 from [:, :-1, :])
-        for val, name in dynamic_val_to_name.items():
-            diff = d - val
-            if 0 < abs(diff) <= 3:
-                return f"{name}{'+' if diff > 0 else '-'}{abs(diff)}"
         return str(d)
 
     def _fmt_shape(shape) -> str:
@@ -445,10 +441,6 @@ def _fmt_dim_eager(d: int, dynamic_val_to_name: dict, static_val_to_name: dict) 
         return dynamic_val_to_name[d]
     if d in static_val_to_name:
         return static_val_to_name[d]
-    for val, name in dynamic_val_to_name.items():
-        diff = d - val
-        if 0 < abs(diff) <= 3:
-            return f"{name}{'+' if diff > 0 else '-'}{abs(diff)}"
     return str(d)
 
 

@@ -79,14 +79,13 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_complex: torch.Tensor
+        freqs_complex: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
     ):
         batch_size, seq_len, _ = x.shape
 
@@ -101,11 +100,11 @@ class SelfAttention(nn.Module):
         xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
         xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
 
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
+        cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
 
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
+        keys = cache_k[:batch_size, : start_pos + seq_len]
+        values = cache_v[:batch_size, : start_pos + seq_len]
 
         keys = repeat_kv(keys, self.n_rep)
         values = repeat_kv(values, self.n_rep)
@@ -162,9 +161,16 @@ class EncoderBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_complex
+            self.attention_norm(x), start_pos, freqs_complex, cache_k, cache_v
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -190,16 +196,26 @@ class Transformer(nn.Module):
 
         self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+        n_kv_heads = args.n_kv_heads if args.n_kv_heads is not None else args.n_heads
+        head_dim = args.dim // args.n_heads
+        self.cache_shape = (args.n_layers, args.max_batch_size, args.max_seq_len, n_kv_heads, head_dim)
+
+    def make_cache(self, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate a fresh (cache_k, cache_v) pair for inference."""
+        return (
+            torch.zeros(self.cache_shape, device=device),
+            torch.zeros(self.cache_shape, device=device),
+        )
+
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache_k: torch.Tensor, cache_v: torch.Tensor):
         batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
 
         h = self.tok_embeddings(tokens)
 
         freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_complex)
+        for i, layer in enumerate(self.layers):
+            h = layer(h, start_pos, freqs_complex, cache_k[i], cache_v[i])
         h = self.norm(h)
         output = self.output(h).float()
         return output
