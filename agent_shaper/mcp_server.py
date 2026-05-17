@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import re
 import importlib.util
 import io
 import os
@@ -30,12 +31,14 @@ from agent_shaper.fx_utils.get_fx_data import (
     ModuleInfo,
     TensorInfo,
     _build_workspace_func_registry,
+    get_annotated_line_map,
     get_module_shapes,
 )
 from agent_shaper.fx_utils.llm_annotate import _TaskSpec, _validate_rewrite
-from agent_shaper.fx_utils.manual_annotate import _annotate_source_lines, _build_line_map
+from agent_shaper.fx_utils.manual_annotate import _annotate_source_lines
 from agent_shaper.fx_utils.test_generator import (
     _capture_function_calls,
+    _DEFAULT_TESTS_DIR,
     _run_capture_indexed,
     _save_fixtures,
     _save_function_fixtures,
@@ -154,25 +157,29 @@ def _find_module(ns: dict) -> Optional[nn.Module]:
 
 
 def _run_fx(script: str):
-    """Execute the script and run FX tracing. Returns (error_str, model, example_args, shape_result)."""
+    """Execute the script and run FX tracing.
+
+    Returns (error_str, model, example_args, shape_result, ns).
+    ns is the script namespace, useful for extracting dim_names etc. without re-executing.
+    """
     try:
         ns = _exec_script(script)
     except Exception:
-        return f"Script execution failed:\n{traceback.format_exc()}", None, None, None
+        return f"Script execution failed:\n{traceback.format_exc()}", None, None, None, None
 
     model = _find_module(ns)
     if model is None:
         return (
             "No nn.Module found in script namespace. "
             "Assign your model to a variable named `model`.",
-            None, None, None,
+            None, None, None, None,
         )
 
     example_args = ns.get("example_args")
     if example_args is None:
-        return "Variable `example_args` not found in script namespace.", None, None, None
+        return "Variable `example_args` not found in script namespace.", None, None, None, None
     if not isinstance(example_args, tuple):
-        return "`example_args` must be a tuple.", None, None, None
+        return "`example_args` must be a tuple.", None, None, None, None
 
     dim_names: Optional[dict] = ns.get("dim_names")
 
@@ -181,9 +188,9 @@ def _run_fx(script: str):
             model, example_args, workspace=_WORKSPACE, dim_names=dim_names
         )
     except Exception:
-        return f"FX shape extraction failed:\n{traceback.format_exc()}", None, None, None
+        return f"FX shape extraction failed:\n{traceback.format_exc()}", None, None, None, None
 
-    return None, model, example_args, shape_result
+    return None, model, example_args, shape_result, ns
 
 
 def _build_dep_order(modules: list) -> list[str]:
@@ -251,23 +258,30 @@ def _workspace_module_classes(abs_src_file: str) -> list[str]:
     return names
 
 
-def _ensure_einops_imports(file_src: str, class_src: str) -> str:
-    """Inject missing einops imports into file_src based on names used in class_src."""
-    needs_rearrange = "rearrange" in class_src and "from einops import rearrange" not in file_src
-    needs_esum = "esum" in class_src and "einsum as esum" not in file_src
-    needs_einsum = (
-        "einsum" in class_src
-        and "einsum as esum" not in file_src
-        and "from einops import einsum" not in file_src
-    )
+_EINOPS_NAMES = ("einsum", "reduce", "rearrange", "repeat", "pack", "unpack")
 
-    inject: list[str] = []
-    if needs_rearrange:
-        inject.append("from einops import rearrange\n")
-    if needs_esum:
-        inject.append("from einops import einsum as esum\n")
-    elif needs_einsum:
-        inject.append("from einops import einsum\n")
+
+def _ensure_einops_imports(file_src: str, class_src: str) -> str:
+    """Inject missing einops imports into file_src based on names used in class_src.
+
+    Handles both plain names (einsum, reduce, ...) and the `einsum as esum` alias.
+    All missing names are collected into a single injected import line.
+    """
+    # Handle the esum alias separately — it needs `einsum as esum`.
+    if "esum" in class_src and "einsum as esum" not in file_src:
+        missing_plain = [
+            n for n in _EINOPS_NAMES
+            if n != "einsum" and n in class_src and f"import {n}" not in file_src
+        ]
+        inject: list[str] = ["from einops import einsum as esum\n"]
+        if missing_plain:
+            inject.append(f"from einops import {', '.join(missing_plain)}\n")
+    else:
+        missing = [
+            n for n in _EINOPS_NAMES
+            if n in class_src and f"import {n}" not in file_src
+        ]
+        inject = [f"from einops import {', '.join(missing)}\n"] if missing else []
 
     if not inject:
         return file_src
@@ -276,7 +290,7 @@ def _ensure_einops_imports(file_src: str, class_src: str) -> str:
     last_import_idx = 0
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("import ") or stripped.startswith("from "):
+        if re.match(r"^(import |from \S+ import )", stripped):
             last_import_idx = i
     return "".join(lines[: last_import_idx + 1] + inject + lines[last_import_idx + 1 :])
 
@@ -310,7 +324,7 @@ def get_fx_shapes(
     Returns:
         Formatted string listing workspace modules and standalone functions with annotated tensor shapes.
     """
-    error, model, example_args, result = _run_fx(script)
+    error, model, example_args, result, _ns = _run_fx(script)
     if error:
         return error
 
@@ -367,16 +381,19 @@ def get_annotated_sources(
     to confirm the rewrite produces identical outputs before reporting it as complete.
     See the `rewrite_workflow` prompt for the full required sequence.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 
     requested = {os.path.abspath(f) for f in files}
 
-    # Build per-file line→tensors map from the full shape result.
-    line_map = _build_line_map(shape_result.modules)
+    # Merged FX + eager-trace line map from get_fx_data.
+    dim_names = _ns.get("dim_names")
+    full_line_map = get_annotated_line_map(
+        model, example_args, workspace=_WORKSPACE, dim_names=dim_names
+    )
     file_to_annotations: dict[str, dict[int, list]] = defaultdict(dict)
-    for (src_file, lineno), tensors in line_map.items():
+    for (src_file, lineno), tensors in full_line_map.items():
         if os.path.abspath(src_file) in requested:
             file_to_annotations[src_file][lineno] = tensors
 
@@ -487,8 +504,8 @@ def get_annotated_sources(
         missed_lines = "\n".join(f"  - {c}" for c in missed)
         warning = (
             "WARNING: The following classes could not be traced by torch.export "
-            "or symbolic_trace — no shape annotations available. Rewrite them "
-            "manually using context from their callers above:\n" + missed_lines
+            "— no shape annotations available. Rewrite them manually using "
+            "context from their callers above:\n" + missed_lines
         )
         header = warning + "\n\n" + header
 
@@ -519,7 +536,7 @@ def validate_rewrite(
     Returns:
         "PASS: ..." on success, or "FAIL: ..." with a detailed error message.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 
@@ -617,7 +634,7 @@ def validate_file_rewrite(
     Returns:
         Summary table of class names with PASS / FAIL status, and a totals line.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 
@@ -710,7 +727,7 @@ def validate_rewrite_function(
     Returns:
         "PASS: ..." on success, or "FAIL: ..." with a detailed error message.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 
@@ -789,7 +806,7 @@ def save_fixtures(
     script: str,
     class_names: list[str],
     func_names: Optional[list[str]] = None,
-    tests_dir: str = "tests",
+    tests_dir: str = _DEFAULT_TESTS_DIR,
 ) -> str:
     """Capture and save forward() fixtures for nn.Module classes and standalone functions.
 
@@ -811,12 +828,12 @@ def save_fixtures(
         script: Python source that sets up model and example_args.
         class_names: List of nn.Module class names to capture fixtures for.
         func_names: List of standalone function names to capture fixtures for.
-        tests_dir: Root test directory (default "tests").
+        tests_dir: Root test directory (default from AGENT_SHAPER_TESTS_DIR env var, else "agent_shaper_tests").
 
     Returns:
         List of fixture paths written, and any names that could not be captured.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 
@@ -985,7 +1002,7 @@ def generate_test_files(
     class_names: list[str],
     rewritten_src_file: str,
     func_names: Optional[list[str]] = None,
-    tests_dir: str = "tests",
+    tests_dir: str = _DEFAULT_TESTS_DIR,
 ) -> str:
     """Generate pytest test files that validate rewritten classes and functions against saved fixtures.
 
@@ -1008,12 +1025,12 @@ def generate_test_files(
         class_names: List of nn.Module class names to generate tests for.
         rewritten_src_file: Relative or absolute path to the rewritten source file.
         func_names: List of standalone function names to generate tests for.
-        tests_dir: Root test directory (default "tests").
+        tests_dir: Root test directory (default from AGENT_SHAPER_TESTS_DIR env var, else "agent_shaper_tests").
 
     Returns:
         List of test file paths written, and any names not found in the traced graph.
     """
-    error, model, example_args, shape_result = _run_fx(script)
+    error, model, example_args, shape_result, _ns = _run_fx(script)
     if error:
         return error
 

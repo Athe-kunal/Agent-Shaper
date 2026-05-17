@@ -59,14 +59,14 @@ def _hashable_shape(shape) -> object:
 
 
 def _build_line_map(
-    module_infos: list[ModuleInfo],
+    infos: list,  # list[ModuleInfo | FunctionInfo]
 ) -> dict[tuple[str, int], list[TensorInfo]]:
-    """Return {(rel_source_file, lineno): [TensorInfo]} across all module infos."""
+    """Return {(rel_source_file, lineno): [TensorInfo]} across all module/function infos."""
     result: dict[tuple[str, int], list[TensorInfo]] = defaultdict(list)
     seen: set[tuple] = set()
 
-    for info in module_infos:
-        for tensor in info.parameters + info.tensors:
+    for info in infos:
+        for tensor in getattr(info, "parameters", []) + info.tensors:
             if tensor.source_file is None or tensor.line_number is None:
                 continue
             dedup = (
