@@ -465,11 +465,21 @@ def get_annotated_sources(
     ]
     # Use enriched_functions (have input_shapes) filtered to requested files.
     enriched_map = {f.func_name: f for f in enriched_functions}
-    functions = [
-        enriched_map.get(f.func_name, f)
-        for f in shape_result.functions
-        if f.source_file and os.path.abspath(f.source_file) in requested
-    ]
+    functions = []
+    for f in shape_result.functions:
+        if not f.source_file or os.path.abspath(f.source_file) not in requested:
+            continue
+        enriched = enriched_map.get(f.func_name, f)
+        # Guard against name collisions: two files defining the same function name can
+        # cause enriched_map to hold a FunctionInfo from the wrong file.  Only use the
+        # enriched entry when its source_file resolves to the same path as the traced
+        # entry; otherwise the wrong file's snippet would be emitted.
+        if (
+            enriched.source_file
+            and os.path.abspath(enriched.source_file) != os.path.abspath(f.source_file)
+        ):
+            enriched = f
+        functions.append(enriched)
 
     # Fall back to the workspace function registry for two cases:
     # 1. Fully uncovered files (no FX coverage at all).

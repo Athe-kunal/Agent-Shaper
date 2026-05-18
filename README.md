@@ -1,6 +1,6 @@
 # Agent Shaper
 
-Agent Shaper extracts per-module tensor shape metadata from any PyTorch `nn.Module` and uses it to annotate source files — either with descriptive shape comments or by rewriting operations as `torch.einsum`.
+Agent Shaper extracts per-module tensor shape metadata from any PyTorch `nn.Module` and uses it to annotate source files — either with descriptive shape comments or by rewriting operations as `torch.einsum` / `einops`.
 
 ## How it works
 
@@ -10,6 +10,7 @@ Agent Shaper extracts per-module tensor shape metadata from any PyTorch `nn.Modu
    - **COMMENT** — rewrites comments with descriptive dimension names (e.g. `batch_size`, `seq_len`, `n_embd`) and plain-English explanations of each transformation.
    - **EINSUM** — rewrites the entire module replacing matmuls and attention operations with `torch.einsum`, collapsing intermediate reshapes where possible.
 4. **Diff viewer** — review LLM changes before accepting them, either in a Streamlit UI or directly in VS Code's native diff editor.
+5. **MCP server** (`agent_shaper/mcp_server.py`) — exposes the full shape-extraction and rewrite-validation pipeline as MCP tools consumable by Claude Code or any MCP-compatible AI assistant.
 
 All modules in a file are processed in parallel via `asyncio`. Everything outside the module classes (imports, dataclasses, config objects) is preserved unchanged in the output file.
 
@@ -22,10 +23,29 @@ agent_shaper/
     manual_annotate.py   # inline shape comment insertion
     llm_annotate.py      # LLM-powered rewrite (COMMENT or EINSUM mode)
     diff_viewer.py       # Streamlit diff UI
-  transformer/
-    model.py             # example GPT model (nanoGPT)
+  mcp_server.py          # MCP tool server for AI-assisted rewrites
+
+examples/
+  transformer/           # GPT-2, LLaMA, Qwen3, Swin Transformer
+    model.py             # nanoGPT reference implementation
+    model_einsum.py      # einsum-rewritten version
+    llama.py / llama_einsum.py
+    qwen3.py / qwen3_einsum.py
+    swin_transformer.py / swin_transformer_einsum.py
     run_transformer.py   # example forward pass
+  alignment/             # standalone alignment loss references
+    alignment_losses.py  # DPO/IPO/SimPO losses (reference einsum style)
+    dpo_losses_einsum.py
+    jsd.py / jsd_einsum.py
+    opd.py / opd_einsum.py
+  direct_alignment/      # full training-ready RLHF loss implementations
+    loss.py              # DPO, IPO, SimPO, ORPO, KTO, APO-zero, APO-down
+    train.py             # training loop
+    data.py              # preference dataset loading
+    config.py            # training configuration
 ```
+
+Each `*_einsum.py` file is the einsum/einops-rewritten counterpart of the original, validated to produce numerically identical outputs (atol=1e-5).
 
 ## Installation
 
@@ -38,6 +58,47 @@ pip install -e .
 ```
 
 ## Usage
+
+### MCP server (recommended for AI-assisted rewrites)
+
+The MCP server is the primary interface for using Agent Shaper with Claude Code. It exposes shape extraction and rewrite validation as tools the model can call directly.
+
+Add it to your Claude Code MCP config:
+
+```json
+{
+  "mcpServers": {
+    "agent-shaper": {
+      "command": "/path/to/.venv/bin/python",
+      "args": ["-m", "agent_shaper.mcp_server"]
+    }
+  }
+}
+```
+
+Available tools:
+
+| Tool | Purpose |
+|---|---|
+| `get_annotated_sources` | Run a setup script, trace the model, return shape-annotated source for the requested files |
+| `get_fx_shapes` | Return raw FX shape data for modules and functions |
+| `validate_rewrite` | Check a rewritten `nn.Module` class produces identical outputs (atol=1e-5) |
+| `validate_rewrite_function` | Check a rewritten standalone function produces identical outputs |
+| `validate_file_rewrite` | Validate all classes in a rewritten file in one call |
+| `save_fixtures` | Capture and persist forward-pass fixtures for later testing |
+| `generate_test_files` | Generate pytest files that assert output identity against saved fixtures |
+
+**Typical rewrite workflow:**
+
+1. Call `get_annotated_sources` with a setup script (assigns `model`, `example_args`, optional `dim_names`) and the list of source files to annotate.
+2. Read the shape-annotated snippets returned for each class and function.
+3. Rewrite the code using `einsum` / `einops`.
+4. Call `validate_rewrite` (for classes) or `validate_rewrite_function` (for standalone functions) to confirm numerical identity before writing to disk.
+
+**Setup script contract** — the script must assign:
+- `model`: an `nn.Module` instance to trace
+- `example_args`: a tuple of example tensors matching `forward()`'s signature
+- `dim_names` *(optional)*: `dict` mapping symbolic dim names to integer values (e.g. `{"B": 4, "T": 16}`) so shapes show `(B, T)` instead of `(4, 16)`
 
 ### Manual shape annotation
 
@@ -147,3 +208,13 @@ Each `ModuleInfo` contains:
 - `tensors` — list of `TensorInfo` for every intermediate FX node in the forward pass
 
 Repeated module instances with identical shape sequences (e.g. transformer blocks) are deduplicated to one entry.
+
+## Examples
+
+The `examples/` folder contains worked rewrites across several model families, each paired with a validated einsum/einops version:
+
+- **`examples/transformer/`** — GPT-2, LLaMA, Qwen3, Swin Transformer. Each model has a `*_einsum.py` counterpart rewritten with `torch.einsum` and `einops`.
+- **`examples/alignment/`** — standalone alignment loss functions (DPO, IPO, SimPO, JSD, OPD) in both original and einsum form.
+- **`examples/direct_alignment/`** — production-style RLHF loss implementations (DPO, cDPO, IPO, SimPO, ORPO, KTO, APO-zero, APO-down) as `nn.Module` classes with a full training loop. The `loss.py` file uses `einops.einsum` and `einops.reduce` throughout, validated against the gather-based originals at atol=1e-5.
+
+All `*_einsum.py` rewrites were validated using the `validate_rewrite` / `validate_rewrite_function` MCP tools.
