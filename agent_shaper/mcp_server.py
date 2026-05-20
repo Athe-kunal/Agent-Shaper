@@ -67,8 +67,7 @@ Rewrite workflow — follow these steps in order for every nn.Module or function
 
 Never skip step 3. A rewrite that has not passed `validate_rewrite` must not be
 presented to the user as a finished result."""
-
-_WORKSPACE = _REPO_ROOT
+_WORKSPACE = os.environ.get("AGENT_SHAPER_WORKSPACE", _REPO_ROOT)                                                                                                                     
 
 
 def _format_tensor(t: TensorInfo, indent: str = "    ") -> str:
