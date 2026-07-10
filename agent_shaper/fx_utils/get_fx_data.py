@@ -19,7 +19,17 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 import torch.fx
 import torch.nn as nn
+from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
 from torch.fx.passes.shape_prop import ShapeProp
+
+
+class DataDependentShapeError(RuntimeError):
+    """Raised when a module's output shapes depend on runtime tensor values.
+
+    Neither strict torch.export nor its draft_export fallback can statically trace
+    such modules (e.g. dynamic packing/padding driven by tensor contents). Callers
+    should fall back to eager-only inspection — see get_eager_line_map.
+    """
 
 
 class TensorInfo(NamedTuple):
@@ -531,6 +541,52 @@ def _export_cache_key(module: nn.Module, example_args: tuple) -> tuple:
     return (type(module).__name__, arg_sig)
 
 
+def _draft_export_or_raise(module, example_args, dynamic_shapes, orig_exc):
+    """Retry with torch.export.draft_export, which tolerates data-dependent guards.
+
+    draft_export records GuardOnDataDependentSymNode as an unbacked symbol instead
+    of hard-failing. If it still fails the same way, the module is genuinely
+    untraceable and we raise a translated error instead of a raw dynamo traceback.
+    """
+    try:
+        return torch.export.draft_export(module, example_args, dynamic_shapes=dynamic_shapes)
+    except GuardOnDataDependentSymNode as exc:
+        raise DataDependentShapeError(
+            "value-dependent output shapes (e.g. dynamic packing/padding driven by "
+            f"tensor contents) — cannot be statically traced: {exc}"
+        ) from exc
+
+
+def _export_module(
+    module: nn.Module,
+    example_args: tuple,
+    dynamic_shapes: dict,
+    dim_names: Optional[dict[str, int]],
+):
+    """Run torch.export with constraint-violation retry and a draft_export fallback.
+
+    Raises DataDependentShapeError instead of GuardOnDataDependentSymNode so callers
+    can degrade gracefully rather than surfacing a raw dynamo traceback.
+    """
+    try:
+        return torch.export.export(module, example_args, dynamic_shapes=dynamic_shapes)
+    except torch._dynamo.exc.UserError as e:
+        error_str = str(e)
+        bounds = _parse_dim_bounds(error_str)
+        # Dims in != guards (e.g. S-1 != 1 from [:, :-1, :]) cannot be resolved
+        # by tightening bounds — the constraint solver doesn't propagate bounds
+        # through arithmetic. Make them static so export succeeds.
+        ne_dims = _parse_ne_guard_dim_names(error_str)
+        retry_dim_names = {k: v for k, v in (dim_names or {}).items() if k not in ne_dims}
+        retry_shapes = _build_dynamic_shapes(module, example_args, retry_dim_names, dim_bounds=bounds)
+        try:
+            return torch.export.export(module, example_args, dynamic_shapes=retry_shapes)
+        except GuardOnDataDependentSymNode as e2:
+            return _draft_export_or_raise(module, example_args, retry_shapes, e2)
+    except GuardOnDataDependentSymNode as e:
+        return _draft_export_or_raise(module, example_args, dynamic_shapes, e)
+
+
 # ─── Eager line tracer for standalone functions ───────────────────────────────
 
 def _fmt_dim_eager(d: int, dynamic_val_to_name: dict, static_val_to_name: dict) -> str:
@@ -731,19 +787,7 @@ def get_module_shapes(
 
     cache_key = _export_cache_key(module, example_args)
     if cache_key not in _export_cache:
-        try:
-            exported = torch.export.export(module, example_args, dynamic_shapes=dynamic_shapes)
-        except torch._dynamo.exc.UserError as e:
-            error_str = str(e)
-            bounds = _parse_dim_bounds(error_str)
-            # Dims in != guards (e.g. S-1 != 1 from [:, :-1, :]) cannot be resolved
-            # by tightening bounds — the constraint solver doesn't propagate bounds
-            # through arithmetic. Make them static so export succeeds.
-            ne_dims = _parse_ne_guard_dim_names(error_str)
-            retry_dim_names = {k: v for k, v in (dim_names or {}).items() if k not in ne_dims}
-            dynamic_shapes = _build_dynamic_shapes(module, example_args, retry_dim_names, dim_bounds=bounds)
-            exported = torch.export.export(module, example_args, dynamic_shapes=dynamic_shapes)
-        _export_cache[cache_key] = exported
+        _export_cache[cache_key] = _export_module(module, example_args, dynamic_shapes, dim_names)
 
     gm = _export_cache[cache_key].module()
     ShapeProp(gm).propagate(*example_args)
@@ -929,6 +973,34 @@ def get_module_shapes(
         ))
 
     return ShapeResult(modules=modules, functions=functions)
+
+
+def get_eager_line_map(
+    module: nn.Module,
+    example_args: tuple,
+    workspace: Optional[str] = None,
+    dim_names: Optional[dict[str, int]] = None,
+) -> tuple[dict, dict]:
+    """Return (eager_map, func_entry_shapes) from a plain eager forward pass — no torch.export.
+
+    Used as a fallback when torch.export cannot trace the module at all (e.g.
+    DataDependentShapeError). Standalone-function shapes are still available because
+    _trace_function_lines only requires running the model, not exporting it.
+
+    Returns
+    -------
+    (eager_map, func_entry_shapes) — same shape as the eager half of
+    get_annotated_line_map's return value.
+    """
+    workspace = workspace or os.getcwd()
+    dynamic_val_to_name: dict[int, str] = {v: k for k, v in (dim_names or {}).items()}
+    path_to_module = dict(module.named_modules())
+    static_val_to_name_eager = _collect_module_attr_names(
+        path_to_module, workspace, dynamic_values=set(dynamic_val_to_name)
+    )
+    return _trace_function_lines(
+        module, example_args, workspace, dynamic_val_to_name, static_val_to_name_eager
+    )
 
 
 def get_annotated_line_map(

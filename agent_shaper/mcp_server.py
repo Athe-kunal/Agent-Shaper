@@ -15,7 +15,7 @@ import traceback
 import uuid
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -27,11 +27,16 @@ import torch.nn as nn
 from mcp.server.fastmcp import FastMCP
 
 from agent_shaper.fx_utils.get_fx_data import (
+    DataDependentShapeError,
     FunctionInfo,
     ModuleInfo,
+    ShapeResult,
     TensorInfo,
     _build_workspace_func_registry,
+    _cls_meta,
+    _is_workspace_cls,
     get_annotated_line_map,
+    get_eager_line_map,
     get_module_shapes,
 )
 from agent_shaper.fx_utils.llm_annotate import _TaskSpec, _validate_rewrite
@@ -127,6 +132,27 @@ def _exec_script(script: str) -> dict:
     return ns
 
 
+def _resolve_func_info_registry(func_name: str) -> Optional[FunctionInfo]:
+    """Return a FunctionInfo for func_name from the workspace file-scan registry only.
+
+    Used by tools that validate via eager hooking rather than FX graph inspection —
+    they never need torch.export, so this never triggers it.
+    """
+    registry = _build_workspace_func_registry(_WORKSPACE)
+    locations = registry.get(func_name)
+    if not locations:
+        return None
+    abs_file, rel_file, line_start, line_end = locations[0]
+    return FunctionInfo(
+        func_name=func_name,
+        source_file=rel_file,
+        line_start=line_start,
+        line_end=line_end,
+        tensors=[],
+        input_shapes=[],
+    )
+
+
 def _resolve_func_infos(
     func_names: list[str],
     traced_functions: list,
@@ -169,41 +195,102 @@ def _find_module(ns: dict) -> Optional[nn.Module]:
     return None
 
 
-def _run_fx(script: str):
-    """Execute the script and run FX tracing.
+def _locate_module_class(model: nn.Module, class_name: str):
+    """Return (origin, sub_module, source_file, line_start, line_end) for the first
+    submodule of model whose class matches class_name, via source inspection only.
 
-    Returns (error_str, model, example_args, shape_result, ns).
-    ns is the script namespace, useful for extracting dim_names etc. without re-executing.
+    No torch.export needed — validate_rewrite only needs eager hooking, so this lets
+    it work even on modules whose forward() has data-dependent output shapes.
+    """
+    for origin, sub_mod in model.named_modules():
+        if type(sub_mod).__name__ == class_name:
+            _src_lines, start, end, src_file, _abs_file = _cls_meta(type(sub_mod))
+            return origin, sub_mod, src_file, start, end
+    return None
+
+
+def _all_module_infos(model: nn.Module, workspace: str) -> list[ModuleInfo]:
+    """Return a ModuleInfo (location + origin only, no shape data) per workspace submodule.
+
+    Built via model.named_modules() + source inspection — no torch.export needed.
+    Used by validate_file_rewrite for dependency ordering and eager-hook capture.
+    """
+    infos: list[ModuleInfo] = []
+    for origin, sub_mod in model.named_modules():
+        cls = type(sub_mod)
+        if not _is_workspace_cls(cls, workspace):
+            continue
+        _src_lines, start, end, src_file, _abs_file = _cls_meta(cls)
+        infos.append(ModuleInfo(
+            class_name=cls.__name__,
+            module_origin=origin or "root",
+            source_file=src_file,
+            line_start=start,
+            line_end=end,
+            forward_line_start=None,
+            parameters=[],
+            tensors=[],
+            input_shapes=[],
+        ))
+    return infos
+
+
+class _ScriptSetup(NamedTuple):
+    model: nn.Module
+    example_args: tuple
+    dim_names: Optional[dict]
+    ns: dict
+
+
+def _setup_script(script: str) -> tuple[Optional[str], Optional[_ScriptSetup]]:
+    """Execute script and validate model/example_args, without running FX tracing.
+
+    Tools that only need eager hooking (validate_rewrite, validate_rewrite_function)
+    call this directly to avoid invoking torch.export at all.
     """
     try:
         ns = _exec_script(script)
     except Exception:
-        return f"Script execution failed:\n{traceback.format_exc()}", None, None, None, None
+        return f"Script execution failed:\n{traceback.format_exc()}", None
 
     model = _find_module(ns)
     if model is None:
         return (
             "No nn.Module found in script namespace. "
             "Assign your model to a variable named `model`.",
-            None, None, None, None,
+            None,
         )
 
     example_args = ns.get("example_args")
     if example_args is None:
-        return "Variable `example_args` not found in script namespace.", None, None, None, None
+        return "Variable `example_args` not found in script namespace.", None
     if not isinstance(example_args, tuple):
-        return "`example_args` must be a tuple.", None, None, None, None
+        return "`example_args` must be a tuple.", None
 
     dim_names: Optional[dict] = ns.get("dim_names")
+    return None, _ScriptSetup(model=model, example_args=example_args, dim_names=dim_names, ns=ns)
+
+
+def _run_fx(script: str):
+    """Execute the script and run FX tracing.
+
+    Returns (error_str, model, example_args, shape_result, ns).
+    ns is the script namespace, useful for extracting dim_names etc. without re-executing.
+    """
+    error, setup = _setup_script(script)
+    if error:
+        return error, None, None, None, None
 
     try:
         shape_result = get_module_shapes(
-            model, example_args, workspace=_WORKSPACE, dim_names=dim_names
+            setup.model, setup.example_args, workspace=_WORKSPACE, dim_names=setup.dim_names
         )
+    except DataDependentShapeError as exc:
+        return f"FX shape extraction failed: {exc}", None, None, None, None
     except Exception:
         return f"FX shape extraction failed:\n{traceback.format_exc()}", None, None, None, None
 
-    return None, model, example_args, shape_result, ns
+    return None, setup.model, setup.example_args, shape_result, setup.ns
 
 
 def _build_dep_order(modules: list) -> list[str]:
@@ -442,17 +529,52 @@ def get_annotated_sources(
     to confirm the rewrite produces identical outputs before reporting it as complete.
     See the `rewrite_workflow` prompt for the full required sequence.
     """
-    error, model, example_args, shape_result, _ns = _run_fx(script)
+    error, setup = _setup_script(script)
     if error:
         return error
+    model, example_args, dim_names = setup.model, setup.example_args, setup.dim_names
 
     requested = {os.path.abspath(f) for f in files}
 
-    # Merged FX + eager-trace line map from get_fx_data.
-    dim_names = _ns.get("dim_names")
-    full_line_map, enriched_functions = get_annotated_line_map(
-        model, example_args, workspace=_WORKSPACE, dim_names=dim_names
-    )
+    fallback_note = None
+    try:
+        shape_result = get_module_shapes(
+            model, example_args, workspace=_WORKSPACE, dim_names=dim_names
+        )
+        full_line_map, enriched_functions = get_annotated_line_map(
+            model, example_args, workspace=_WORKSPACE, dim_names=dim_names
+        )
+    except DataDependentShapeError as exc:
+        # torch.export can't trace this model at all — fall back to a pure workspace
+        # file-scan registry for locating functions/classes, and a plain eager forward
+        # pass (no export needed) for standalone-function shapes. Module-level shapes
+        # are unavailable since those require the FX graph.
+        shape_result = ShapeResult(modules=[], functions=[])
+        eager_map, func_entry_shapes = get_eager_line_map(
+            model, example_args, workspace=_WORKSPACE, dim_names=dim_names
+        )
+        full_line_map = eager_map
+        registry = _build_workspace_func_registry(_WORKSPACE)
+        enriched_functions = [
+            FunctionInfo(
+                func_name=name,
+                source_file=locations[0][1],
+                line_start=locations[0][2],
+                line_end=locations[0][3],
+                tensors=[],
+                input_shapes=func_entry_shapes.get(name, []),
+            )
+            for name, locations in registry.items()
+        ]
+        fallback_note = (
+            "NOTE: torch.export could not trace this model — it has "
+            f"{exc}\n"
+            "Falling back to eager execution: standalone-function shapes below are "
+            "real (captured live), but module-level shape annotations are unavailable. "
+            "Modules affected are listed as untraceable in the warning below — "
+            "rewrite them manually using context from their callers."
+        )
+
     file_to_annotations: dict[str, dict[int, list]] = defaultdict(dict)
     for (src_file, lineno), tensors in full_line_map.items():
         if os.path.abspath(src_file) in requested:
@@ -603,6 +725,9 @@ def get_annotated_sources(
         )
         header = warning + "\n\n" + header
 
+    if fallback_note:
+        header = fallback_note + "\n\n" + header
+
     return header + "\n\n" + "\n".join(sections)
 
 
@@ -630,28 +755,43 @@ def validate_rewrite(
     Returns:
         "PASS: ..." on success, or "FAIL: ..." with a detailed error message.
     """
-    error, model, example_args, shape_result, _ns = _run_fx(script)
+    error, setup = _setup_script(script)
     if error:
         return error
+    model, example_args = setup.model, setup.example_args
 
-    target = next(
-        (m for m in shape_result.modules if m.class_name == class_name), None
-    )
-    if target is None:
-        return f"Class '{class_name}' not found in traced workspace modules."
-    if target.source_file is None or target.line_start is None or target.line_end is None:
+    # This tool validates via eager hooking, not FX graph inspection, so it never
+    # needs torch.export — locate the target class purely by walking the model's
+    # actual submodules. This also works for modules with data-dependent output
+    # shapes that torch.export cannot statically trace.
+    located = _locate_module_class(model, class_name)
+    if located is None:
+        return f"Class '{class_name}' not found in model's submodules."
+    origin, _sub_mod, source_file, line_start, line_end = located
+    if source_file is None or line_start is None or line_end is None:
         return f"Source location not available for class '{class_name}'."
 
-    capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
+    target_module_info = ModuleInfo(
+        class_name=class_name,
+        module_origin=origin or "root",
+        source_file=source_file,
+        line_start=line_start,
+        line_end=line_end,
+        forward_line_start=None,
+        parameters=[],
+        tensors=[],
+        input_shapes=[],
+    )
+    capture_map = _run_capture_indexed(model, example_args, [target_module_info])
     capture_entry = capture_map.get(class_name)
     if capture_entry is None:
         return f"Could not capture forward() output for class '{class_name}'."
 
     try:
-        with open(target.source_file) as fh:
+        with open(source_file) as fh:
             file_source_lines = fh.readlines()
     except OSError:
-        return f"Could not read source file: {target.source_file}"
+        return f"Could not read source file: {source_file}"
 
     # Splice the rewritten class into the original file so its existing imports are
     # preserved, then inject any missing einops imports.
@@ -659,9 +799,9 @@ def validate_rewrite(
     if rewrite_lines and not rewrite_lines[-1].endswith("\n"):
         rewrite_lines[-1] += "\n"
     patched_lines = (
-        file_source_lines[: target.line_start - 1]
+        file_source_lines[: line_start - 1]
         + rewrite_lines
-        + file_source_lines[target.line_end :]
+        + file_source_lines[line_end:]
     )
     patched_src = _ensure_einops_imports("".join(patched_lines), rewritten_class_src)
 
@@ -728,17 +868,23 @@ def validate_file_rewrite(
     Returns:
         Summary table of class names with PASS / FAIL status, and a totals line.
     """
-    error, model, example_args, shape_result, _ns = _run_fx(script)
+    error, setup = _setup_script(script)
     if error:
         return error
+    model, example_args = setup.model, setup.example_args
 
     try:
         ast.parse(rewritten_file_src)
     except SyntaxError as exc:
         return f"Syntax error in rewritten file: {exc}"
 
-    capture_map = _run_capture_indexed(model, example_args, shape_result.modules)
-    known_classes = {m.class_name for m in shape_result.modules}
+    # This tool validates via eager hooking, not FX graph inspection, so it never
+    # needs torch.export — build module locations by walking the model's actual
+    # submodules directly, which also works for modules with data-dependent output
+    # shapes that torch.export cannot statically trace.
+    module_infos = _all_module_infos(model, _WORKSPACE)
+    capture_map = _run_capture_indexed(model, example_args, module_infos)
+    known_classes = {m.class_name for m in module_infos}
 
     # Load the entire rewritten file as a temp module so its own imports are preserved.
     # This avoids the problem of splicing a class that uses aliased einops names (esum,
@@ -765,7 +911,7 @@ def validate_file_rewrite(
         return True
 
     rows: list[str] = []
-    for class_name in _build_dep_order(shape_result.modules):
+    for class_name in _build_dep_order(module_infos):
         if class_name not in known_classes or not hasattr(tmp_mod, class_name):
             continue
         entry = capture_map.get(class_name)
@@ -821,19 +967,20 @@ def validate_rewrite_function(
     Returns:
         "PASS: ..." on success, or "FAIL: ..." with a detailed error message.
     """
-    error, model, example_args, shape_result, _ns = _run_fx(script)
+    error, setup = _setup_script(script)
     if error:
         return error
+    model, example_args = setup.model, setup.example_args
 
-    func_infos, not_found = _resolve_func_infos([func_name], shape_result.functions)
-    if not_found:
+    # This tool validates via eager hooking, not FX graph inspection, so it never
+    # needs torch.export — resolve the function purely from the workspace file-scan
+    # registry (AST-based), which works even for functions with data-dependent
+    # output shapes that torch.export cannot statically trace.
+    fi = _resolve_func_info_registry(func_name)
+    if fi is None:
         return f"Function '{func_name}' not found in workspace registry."
 
-    fi = func_infos[0]
-    if fi.source_file is None or fi.line_start is None or fi.line_end is None:
-        return f"Source location not available for function '{func_name}'."
-
-    fn_capture_map = _capture_function_calls(model, example_args, func_infos)
+    fn_capture_map = _capture_function_calls(model, example_args, [fi])
     entry = fn_capture_map.get(func_name)
     if entry is None:
         return (
